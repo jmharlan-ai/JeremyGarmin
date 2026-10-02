@@ -8,6 +8,9 @@ fi
 
 BIN_DIR="$HOME/.local/bin"
 
+# garmin-pp-cli fails to save a login if its config dir is missing.
+mkdir -p "$HOME/.config/garmin-pp-cli"
+
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export PATH=\"$BIN_DIR:\$PATH\"" >> "$CLAUDE_ENV_FILE"
 fi
