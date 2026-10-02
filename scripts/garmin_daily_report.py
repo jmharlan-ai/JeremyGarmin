@@ -721,6 +721,9 @@ def render(report, days, ms, recs, plan, generated):
                     f'<td class="num">{fmt(m["a30"], m["dec"])}</td><td class="num">{d7}</td>'
                     f'<td><span class="pill {m["status"]}">{icon} {word}</span></td></tr>')
 
+    pending = "" if isinstance(by["sleep_h"]["cur"], (int, float)) else (
+        '<div class="panel"><b>Last night\'s sleep hasn\'t synced yet.</b> <span class="muted">Sleep, HRV and readiness '
+        'fill in after your watch syncs with Garmin Connect. Ask Claude to rerun the report after you wake.</span></div>')
     acts = days.get(yday.isoformat(), {}).get("activities", [])
     act_html = "".join(
         f'<li><span>{esc(a["name"])}</span><span class="num muted">{(a["dur_min"] or 0):.0f} min · load {(a["load"] or 0):.0f}'
@@ -736,6 +739,7 @@ def render(report, days, ms, recs, plan, generated):
 <h1>Last 24 hours vs your 7- and 30-day averages</h1>
 <span class="muted">Sleep and recovery from the night ending {report.strftime('%b %-d')}; daytime totals from {yday.strftime('%A %b %-d')}.</span></header>
 
+{pending}
 <div class="band"><div class="state {tone}"><span class="eyebrow">Today</span><span class="label">{esc(state)}</span>
 <span class="num muted">{esc(summary)}</span></div>
 <ul>{''.join(f'<li>{esc(b)}</li>' for b in bullets)}</ul></div>
@@ -818,7 +822,7 @@ def main() -> int:
     recs, plan = recommendations(ms, days, report)
     out.write_text(render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z")))
     state, tone, summary, bullets = headline(ms, recs)
-    result = dict(report_date=report.isoformat(), state=state, summary=summary, bullets=bullets,
+    result = dict(report_date=report.isoformat(), sleep_synced=isinstance(next(m for m in ms if m["key"] == "sleep_h")["cur"], (int, float)), state=state, summary=summary, bullets=bullets,
                   recommendations=[dict(title=r["title"], body=r["body"]) for r in recs],
                   tonight=plan,
                   metrics=[{k: m.get(k) for k in ("label", "cur", "a7", "a30", "status", "unit")} for m in ms])
