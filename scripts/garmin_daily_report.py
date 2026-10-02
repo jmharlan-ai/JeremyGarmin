@@ -396,7 +396,9 @@ def headline(ms, recs):
     alerts = [m for m in ms if m["status"] == "alert"]
     watch = [m for m in ms if m["status"] == "watch"]
     better = [m for m in ms if m["status"] == "better"]
-    if (isinstance(r, (int, float)) and r < 40) or len(alerts) >= 2:
+    if not isinstance(r, (int, float)) and not isinstance(by["sleep_h"]["cur"], (int, float)):
+        state, tone = "Waiting for sync", "warning"
+    elif (isinstance(r, (int, float)) and r < 40) or len(alerts) >= 2:
         state, tone = "Recover", "critical"
     elif (isinstance(r, (int, float)) and r < 65) or alerts or len(watch) >= 3:
         state, tone = "Train with care", "warning"
