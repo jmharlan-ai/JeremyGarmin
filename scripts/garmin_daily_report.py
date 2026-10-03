@@ -148,7 +148,65 @@ def load(report: dt.date) -> dict[str, dict]:
         if "steps" in d:
             d.setdefault("train_load", 0.0)
             d.setdefault("train_min", 0.0)
+    fill_live(days, report)
     return days
+
+
+def live(args: list[str]):
+    p = run([*args, "--agent", "--data-source", "live"], timeout=120)
+    if p.returncode != 0:
+        return None
+    try:
+        r = json.loads(p.stdout).get("results")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if isinstance(r, list):
+        r = max(r, key=lambda x: str(x.get("timestamp", "")), default=None) if r else None
+    return r if isinstance(r, dict) else None
+
+
+def dig(obj, path):
+    for part in path.split("."):
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(part)
+    return obj
+
+
+def fill_live(days, report):
+    """`history` treats per-day series as complete only through yesterday, so this
+    morning's sleep, readiness and summary are fetched live when the archive lacks them."""
+    d = report.isoformat()
+    rec = days.setdefault(d, {})
+
+    def take(src, mapping):
+        if not src:
+            return
+        for key, (path, scale) in mapping.items():
+            v = dig(src, path)
+            if isinstance(v, (int, float)) and not (key in ("stress",) and v < 0):
+                rec.setdefault(key, v * scale)
+            elif isinstance(v, str) and key == "hrv_status":
+                rec.setdefault(key, v)
+
+    if "sleep_h" not in rec:
+        take(live(["sleep", "night", "x", "--date", d]), {
+            "sleep_h": ("dailySleepDTO.sleepTimeSeconds", 1 / 3600), "sleep_score": ("dailySleepDTO.sleepScores.overall.value", 1),
+            "deep_min": ("dailySleepDTO.deepSleepSeconds", 1 / 60), "light_min": ("dailySleepDTO.lightSleepSeconds", 1 / 60),
+            "rem_min": ("dailySleepDTO.remSleepSeconds", 1 / 60), "awake_min": ("dailySleepDTO.awakeSleepSeconds", 1 / 60),
+            "sleep_stress": ("dailySleepDTO.avgSleepStress", 1), "bed_ms": ("dailySleepDTO.sleepStartTimestampLocal", 1),
+            "wake_ms": ("dailySleepDTO.sleepEndTimestampLocal", 1), "sleep_need_min": ("dailySleepDTO.sleepNeed.actual", 1),
+            "sleep_spo2": ("dailySleepDTO.averageSpO2Value", 1), "sleep_resp": ("dailySleepDTO.averageRespirationValue", 1),
+            "hrv": ("avgOvernightHrv", 1), "hrv_status": ("hrvStatus", 1), "sleep_rhr": ("restingHeartRate", 1),
+            "skin_temp_dev": ("avgSkinTempDeviationC", 1)})
+    if "readiness" not in rec:
+        take(live(["training", "readiness", "x", "--date", d]), {
+            "readiness": ("score", 1), "acute_load": ("acuteLoad", 1), "recovery_h": ("recoveryTime", 1 / 60)})
+    if "bb_wake" not in rec:
+        # The daily-summary path is keyed by the account's display name.
+        name = dig(live(["account", "social-profile"]), "displayName") or "x"
+        take(live(["wellness", "daily-summary", name, "--calendar-date", d]), {
+            "bb_wake": ("bodyBatteryAtWakeTime", 1), "bb_charge": ("bodyBatteryDuringSleep", 1)})
 
 
 # ---------------------------------------------------------------- metrics
@@ -422,7 +480,8 @@ def headline(ms, recs):
         names = ", ".join(m["label"] for m in better[:4])
         bullets.append(f"Better than your 30-day average: {names}.")
     if recs:
-        bullets.append(f"Top action: {recs[0]['title'].lower()}.")
+        title = recs[0]["title"]
+        bullets.append(f"Top action: {title[0].lower() + title[1:]}.")
     if not (alerts or watch):
         bullets.append("Nothing is trending the wrong way. Keep the current routine.")
     return state, tone, summary, bullets
