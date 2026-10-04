@@ -202,11 +202,25 @@ def fill_live(days, report):
     if "readiness" not in rec:
         take(live(["training", "readiness", "x", "--date", d]), {
             "readiness": ("score", 1), "acute_load": ("acuteLoad", 1), "recovery_h": ("recoveryTime", 1 / 60)})
+    # The daily-summary path is keyed by the account's display name.
+    name = dig(live(["account", "social-profile"]), "displayName") or "x"
     if "bb_wake" not in rec:
-        # The daily-summary path is keyed by the account's display name.
-        name = dig(live(["account", "social-profile"]), "displayName") or "x"
         take(live(["wellness", "daily-summary", name, "--calendar-date", d]), {
             "bb_wake": ("bodyBatteryAtWakeTime", 1), "bb_charge": ("bodyBatteryDuringSleep", 1)})
+
+    # `history` can archive yesterday's summary from an early-morning snapshot and
+    # never refresh it, so yesterday's daytime totals always come from the live call.
+    y = (report - dt.timedelta(days=1)).isoformat()
+    summary = live(["wellness", "daily-summary", name, "--calendar-date", y])
+    if summary and isinstance(summary.get("totalSteps"), (int, float)):
+        yrec = days.setdefault(y, {})
+        for key, path, scale in (("steps", "totalSteps", 1), ("step_goal", "dailyStepGoal", 1),
+                                 ("stress", "averageStressLevel", 1), ("high_stress_min", "highStressDuration", 1 / 60),
+                                 ("bb_low", "bodyBatteryLowestValue", 1), ("rhr", "restingHeartRate", 1),
+                                 ("spo2", "averageSpo2", 1), ("resp", "avgWakingRespirationValue", 1)):
+            v = summary.get(path)
+            if isinstance(v, (int, float)) and v >= 0:
+                yrec[key] = v * scale
 
 
 # ---------------------------------------------------------------- metrics
