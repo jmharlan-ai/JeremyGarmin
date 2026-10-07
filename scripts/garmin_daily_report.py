@@ -31,6 +31,9 @@ from pathlib import Path
 
 CLI = os.environ.get("GARMIN_CLI", "garmin-pp-cli")
 LOOKBACK = 45  # days pulled from the archive (30-day window + chart padding)
+# Workout suggestions only ever use these activities.
+ACTIVITIES = ("walking", "strength", "running")
+HARD_LABELS = {"VO2MAX", "THRESHOLD", "ANAEROBIC_CAPACITY", "SPEED"}
 
 
 # ---------------------------------------------------------------- data access
@@ -134,7 +137,8 @@ def load(report: dt.date) -> dict[str, dict]:
         json_extract(data,'$.duration')/60.0 dur_min,
         json_extract(data,'$.activityTrainingLoad') load,
         json_extract(data,'$.averageHR') avg_hr,
-        json_extract(data,'$.aerobicTrainingEffect') te
+        json_extract(data,'$.aerobicTrainingEffect') te,
+        json_extract(data,'$.trainingEffectLabel') te_label
       FROM resources WHERE resource_type='activities'
         AND substr(json_extract(data,'$.startTimeLocal'),1,10) BETWEEN '{start}' AND '{end}'
       ORDER BY start""")
@@ -756,7 +760,77 @@ document.addEventListener('pointerleave',function(){t.hidden=true})})();
 """
 
 
-def render(report, days, ms, recs, plan, generated):
+def running_zones():
+    """Running heart-rate zone floors (z1..z5) from Garmin, or None."""
+    try:
+        rows = sql("SELECT data FROM resources WHERE resource_type='hr_zone_config'")
+        cfg = json.loads(rows[0]["data"]) if rows else {}
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        return None
+    zones = cfg.get("heartRateZones", []) if isinstance(cfg, dict) else []
+    pick = next((z for z in zones if z.get("sport") == "RUNNING"), None) or next(
+        (z for z in zones if z.get("sport") == "DEFAULT"), None)
+    if not pick:
+        return None
+    floors = [pick.get(f"zone{i}Floor") for i in range(1, 6)]
+    return floors if all(isinstance(f, (int, float)) for f in floors) else None
+
+
+def workout(ms, days, report, zones):
+    """Today's session, chosen from walking, strength and running only."""
+    by = {m["key"]: m for m in ms}
+    r = by["readiness"]["cur"]
+    if not isinstance(r, (int, float)):
+        return None
+    bad = {k for k, m in by.items() if m["status"] in ("watch", "alert")}
+    flags = sum(k in bad for k in ("hrv", "sleep_rhr", "bb_wake", "sleep_resp"))
+    recent = []
+    for i in (1, 2):
+        recent += days.get((report - dt.timedelta(days=i)).isoformat(), {}).get("activities", [])
+    hard_48h = [a for a in recent if (a.get("te_label") in HARD_LABELS) or (a.get("load") or 0) >= 180]
+    yday = days.get((report - dt.timedelta(days=1)).isoformat(), {}).get("activities", [])
+    strength_yday = any(a.get("type") == "strength_training" and (a.get("dur_min") or 0) >= 15 for a in yday)
+    z1, z2, z3, z4, z5 = zones or (None,) * 5
+    hr = lambda lo, hi: f" (heart rate {lo:.0f}–{hi:.0f} bpm)" if lo and hi else ""
+    easy_cap = f" (heart rate under {z2:.0f} bpm)" if z2 else ""
+
+    if r < 30 or flags >= 3:
+        level = "Rest"
+        why = f"Readiness {r:.0f} with {flags} recovery markers down."
+        opts = [("Walking", "30–45 min easy walk, ideally outdoors, plus 10 min of gentle mobility."),
+                ("Strength", "Skip today."), ("Running", "Skip today.")]
+    elif r < 60 or hard_48h or flags >= 2:
+        level = "Easy"
+        reason = []
+        if r < 60:
+            reason.append(f"readiness {r:.0f}")
+        if hard_48h:
+            reason.append(f"a hard session in the last 48 h ({hard_48h[-1]['name']})")
+        if flags >= 2:
+            reason.append(f"{flags} recovery markers down")
+        why = "Easy day because of " + " and ".join(reason) + "."
+        opts = [("Walking", "45–60 min brisk walk. The best choice if your legs feel heavy."),
+                ("Running", f"30–40 min easy run on flat ground{easy_cap}. Walk the hills."),
+                ("Strength", "20–30 min upper body and core only, light weights." if not strength_yday
+                 else "Skip; you did strength yesterday. 10–15 min of mobility instead.")]
+    elif r < 75:
+        level = "Moderate"
+        why = f"Readiness {r:.0f}: good for steady aerobic work, not intervals."
+        opts = [("Running", f"45–60 min steady run in zone 2{hr(z2, z3 - 1 if z3 else None)}."),
+                ("Strength", "30–40 min full-body strength, moderate weights." if not strength_yday
+                 else "Light core and mobility only; you did strength yesterday."),
+                ("Walking", "30 min easy walk later in the day for recovery and steps.")]
+    else:
+        level = "Quality"
+        why = f"Readiness {r:.0f} and no hard session in the last 48 h: a good day for your key workout."
+        opts = [("Running", f"Threshold run: 15 min easy, 3 × 8 min in zone 4{hr(z4, z5 - 1 if z5 else None)} "
+                 f"with 2 min easy jogs, 10 min cool-down. Or a long run in zone 2{hr(z2, z3 - 1 if z3 else None)}."),
+                ("Strength", "30–40 min full-body strength, after the run or later in the day, not before it."),
+                ("Walking", "20–30 min easy walk in the evening to loosen up.")]
+    return dict(level=level, why=why, options=[dict(activity=a, plan=t) for a, t in opts])
+
+
+def render(report, days, ms, recs, plan, generated, wo=None):
     by = {m["key"]: m for m in ms}
     state, tone, summary, bullets = headline(ms, recs)
     yday = report - dt.timedelta(days=1)
@@ -799,6 +873,12 @@ def render(report, days, ms, recs, plan, generated):
     pending = "" if isinstance(by["sleep_h"]["cur"], (int, float)) else (
         '<div class="panel"><b>Last night\'s sleep hasn\'t synced yet.</b> <span class="muted">Sleep, HRV and readiness '
         'fill in after your watch syncs with Garmin Connect. Ask Claude to rerun the report after you wake.</span></div>')
+    workout_html = ""
+    if wo:
+        workout_html = (f'<section><h2>Today\'s workout <span class="pill steady">{esc(wo["level"])}</span></h2>'
+                        f'<div class="muted">{esc(wo["why"])}</div><div class="recs">'
+                        + "".join(f'<div class="rec"><span class="p p3">{esc(o["activity"])}</span><p>{esc(o["plan"])}</p></div>'
+                                  for o in wo["options"]) + "</div></section>")
     acts = days.get(yday.isoformat(), {}).get("activities", [])
     act_html = "".join(
         f'<li><span>{esc(a["name"])}</span><span class="num muted">{(a["dur_min"] or 0):.0f} min · load {(a["load"] or 0):.0f}'
@@ -821,6 +901,7 @@ def render(report, days, ms, recs, plan, generated):
 
 <div class="tiles">{tile('readiness')}{tile('sleep_h')}{tile('hrv')}{tile('sleep_rhr')}</div>
 
+{workout_html}
 <section><h2>What to do today</h2>
 <div class="muted">Tonight's target: lights out by <b>{plan['lights_out']}</b> for {plan['target_h']:.1f} h before a {plan['wake']} wake-up.</div>
 <div class="recs">{rec_html}</div></section>
@@ -895,11 +976,12 @@ def main() -> int:
 
     ms = assess(days, report)
     recs, plan = recommendations(ms, days, report)
-    out.write_text(render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z")))
+    wo = workout(ms, days, report, running_zones())
+    out.write_text(render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo))
     state, tone, summary, bullets = headline(ms, recs)
     result = dict(report_date=report.isoformat(), sleep_synced=isinstance(next(m for m in ms if m["key"] == "sleep_h")["cur"], (int, float)), state=state, summary=summary, bullets=bullets,
                   recommendations=[dict(title=r["title"], body=r["body"]) for r in recs],
-                  tonight=plan,
+                  tonight=plan, workout=wo,
                   metrics=[{k: m.get(k) for k in ("label", "cur", "a7", "a30", "status", "unit")} for m in ms])
     if args.json:
         Path(args.json).write_text(json.dumps(result, indent=1, default=str))
