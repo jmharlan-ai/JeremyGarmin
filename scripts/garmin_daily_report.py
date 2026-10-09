@@ -471,12 +471,15 @@ def headline(ms, recs):
     r = by["readiness"]["cur"]
     alerts = [m for m in ms if m["status"] == "alert"]
     watch = [m for m in ms if m["status"] == "watch"]
+    # Only recovery and sleep metrics decide the day's state; steps or stress alone don't.
+    rec_alerts = [m for m in alerts if m["group"] in ("Recovery", "Sleep")]
+    rec_watch = [m for m in watch if m["group"] in ("Recovery", "Sleep")]
     better = [m for m in ms if m["status"] == "better"]
     if not isinstance(r, (int, float)) and not isinstance(by["sleep_h"]["cur"], (int, float)):
         state, tone = "Waiting for sync", "warning"
-    elif (isinstance(r, (int, float)) and r < 40) or len(alerts) >= 2:
+    elif (isinstance(r, (int, float)) and r < 40) or sum(m["group"] == "Recovery" for m in rec_alerts) >= 2:
         state, tone = "Recover", "critical"
-    elif (isinstance(r, (int, float)) and r < 65) or alerts or len(watch) >= 3:
+    elif (isinstance(r, (int, float)) and r < 65) or rec_alerts or len(rec_watch) >= 3:
         state, tone = "Train with care", "warning"
     else:
         state, tone = "Ready to train", "good"
@@ -787,10 +790,23 @@ def workout(ms, days, report, zones):
     recent = []
     for i in (1, 2):
         recent += days.get((report - dt.timedelta(days=i)).isoformat(), {}).get("activities", [])
-    hard_48h = [a for a in recent if (a.get("te_label") in HARD_LABELS) or (a.get("load") or 0) >= 180]
+    # Garmin labels most strength sessions "anaerobic", so only load marks strength as hard.
+    hard_48h = [a for a in recent if (a.get("load") or 0) >= 180
+                or (a.get("te_label") in HARD_LABELS and a.get("type") != "strength_training")]
     yday = days.get((report - dt.timedelta(days=1)).isoformat(), {}).get("activities", [])
     strength_yday = any(a.get("type") == "strength_training" and (a.get("dur_min") or 0) >= 15 for a in yday)
     z1, z2, z3, z4, z5 = zones or (None,) * 5
+    done = [a for a in days.get(report.isoformat(), {}).get("activities", [])
+            if (a.get("load") or 0) >= 100 or (a.get("dur_min") or 0) >= 45]
+    if done:
+        main = max(done, key=lambda a: a.get("load") or 0)
+        mins = sum(a.get("dur_min") or 0 for a in done)
+        load = sum(a.get("load") or 0 for a in done)
+        return dict(level="Done", why=f"Today's main session is already in: {main['name']} "
+                    f"({mins:.0f} min, load {load:.0f}). Keep the rest of the day easy.",
+                    options=[dict(activity="Walking", plan="20–30 min easy walk later in the day to loosen up."),
+                             dict(activity="Strength", plan="Optional 10–15 min core and mobility. No heavy lifting on top of today's session."),
+                             dict(activity="Running", plan="Done for today.")])
     hr = lambda lo, hi: f" (heart rate {lo:.0f}–{hi:.0f} bpm)" if lo and hi else ""
     easy_cap = f" (heart rate under {z2:.0f} bpm)" if z2 else ""
 
