@@ -382,7 +382,7 @@ def recommendations(ms, days, report):
             f"Hydrate early, skip alcohol tonight, and check again tomorrow; two high mornings in a row means rest.{extra}",
             ["sleep_rhr"])
 
-    if "sleep_h" in bad or "sleep_score" in bad:
+    if "sleep_h" in bad:
         m = by["sleep_h"]
         late = ""
         if usual_bed is not None and isinstance(today.get("bed_ms"), (int, float)):
@@ -390,7 +390,7 @@ def recommendations(ms, days, report):
             last_bed = last_bed if last_bed > 12 * 60 else last_bed + 24 * 60
             if last_bed - usual_bed >= 30:
                 late = f" You fell asleep at {clock(last_bed)}, {int(last_bed - usual_bed)} min later than usual."
-        add(1 if "sleep_h" in bad else 2, "Get to bed earlier tonight",
+        add(1, "Get to bed earlier tonight",
             f"You slept {fmt(m['cur'], 1)} h vs {fmt(m['a30'], 1)} h on average.{late} "
             f"To get {target_h:.1f} h before your usual {clock(wake)} wake-up, have lights out by {clock(lights_out)}. "
             f"Start winding down (screens off, dim lights) 30 min before that.", ["sleep_h", "sleep_score"])
