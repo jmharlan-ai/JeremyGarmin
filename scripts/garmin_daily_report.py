@@ -423,9 +423,10 @@ def recommendations(ms, days, report):
             f"No caffeine after 1 PM, limit fluids in the last 90 minutes before bed, and keep the room dark.", ["awake_min"])
 
     if "bb_wake" in bad or "bb_charge" in bad:
-        m = by["bb_wake"]
+        m = by["bb_wake"] if "bb_wake" in bad else by["bb_charge"]
+        what = "at wake was" if "bb_wake" in bad else "recharged only"
         add(3, "Recharge Body Battery",
-            f"Body Battery at wake was {fmt(m['cur'])} vs {fmt(m['a30'])} usually. Plan a 10–20 min low-stress break "
+            f"Body Battery {what} {fmt(m['cur'])} overnight vs {fmt(m['a30'])} usually. Plan a 10–20 min low-stress break "
             f"this afternoon (walk outside or rest), and keep the evening calm so tonight's recharge is fuller.", ["bb_wake", "bb_charge"])
 
     if "stress" in bad or "high_stress_min" in bad:
@@ -829,9 +830,11 @@ def workout(ms, days, report, zones):
                 ("Running", f"30–40 min easy run on flat ground{easy_cap}. Walk the hills."),
                 ("Strength", "20–30 min upper body and core only, light weights." if not strength_yday
                  else "Skip; you did strength yesterday. 10–15 min of mobility instead.")]
-    elif r < 75:
+    elif r < 75 or any(by[k]["status"] == "alert" for k in ("hrv", "sleep_rhr", "sleep_resp")):
         level = "Moderate"
-        why = f"Readiness {r:.0f}: good for steady aerobic work, not intervals."
+        caution = [by[k]["label"].lower() for k in ("hrv", "sleep_rhr", "sleep_resp") if by[k]["status"] == "alert"]
+        why = (f"Readiness {r:.0f}: good for steady aerobic work, not intervals." if not caution else
+               f"Readiness {r:.0f}, but {', '.join(caution)} is well off your usual: steady aerobic work only, no intervals.")
         opts = [("Running", f"45–60 min steady run in zone 2{hr(z2, z3 - 1 if z3 else None)}."),
                 ("Strength", "30–40 min full-body strength, moderate weights." if not strength_yday
                  else "Light core and mobility only; you did strength yesterday."),
