@@ -424,9 +424,9 @@ def recommendations(ms, days, report):
 
     if "bb_wake" in bad or "bb_charge" in bad:
         m = by["bb_wake"] if "bb_wake" in bad else by["bb_charge"]
-        what = "at wake was" if "bb_wake" in bad else "recharged only"
+        what = "at wake was {} vs {} usually." if "bb_wake" in bad else "recharged only {} overnight vs {} usually."
         add(3, "Recharge Body Battery",
-            f"Body Battery {what} {fmt(m['cur'])} overnight vs {fmt(m['a30'])} usually. Plan a 10–20 min low-stress break "
+            f"Body Battery {what.format(fmt(m['cur']), fmt(m['a30']))} Plan a 10–20 min low-stress break "
             f"this afternoon (walk outside or rest), and keep the evening calm so tonight's recharge is fuller.", ["bb_wake", "bb_charge"])
 
     if "stress" in bad or "high_stress_min" in bad:
