@@ -362,8 +362,9 @@ def recommendations(ms, days, report):
         lvl = ("a rest day or 30–40 min of easy zone 1–2" if (readiness or 0) < 30
                else "an easy session at zone 2 or below, under 60 min")
         add(1, "Make today an easy day",
-            f"Readiness is {fmt(readiness)} and {recovery_flags} recovery markers are below your averages. "
-            f"Swap any planned threshold or interval work for {lvl}. Move the hard session to the first morning readiness is back above 60.",
+            f"Readiness is {fmt(readiness)}"
+            + (f" and {recovery_flags} recovery marker{'s are' if recovery_flags != 1 else ' is'} below your averages. " if recovery_flags else ". ")
+            + f"Swap any planned threshold or interval work for {lvl}. Move the hard session to the first morning readiness is back above 60.",
             ["readiness", "hrv", "sleep_rhr", "bb_wake"])
     elif hrv_bad:
         m = by["hrv"]
@@ -813,7 +814,8 @@ def workout(ms, days, report, zones):
 
     if r < 30 or flags >= 3:
         level = "Rest"
-        why = f"Readiness {r:.0f} with {flags} recovery markers down."
+        why = (f"Readiness {r:.0f} with {flags} recovery markers down." if flags else
+               f"Readiness {r:.0f} is still low from recent training, even though overnight markers look normal.")
         opts = [("Walking", "30–45 min easy walk, ideally outdoors, plus 10 min of gentle mobility."),
                 ("Strength", "Skip today."), ("Running", "Skip today.")]
     elif r < 60 or hard_48h or flags >= 2:
