@@ -814,7 +814,7 @@ def workout(ms, days, report, zones):
 
     if r < 30 or flags >= 3:
         level = "Rest"
-        why = (f"Readiness {r:.0f} with {flags} recovery markers down." if flags else
+        why = (f"Readiness {r:.0f} with {flags} recovery marker{'s' if flags != 1 else ''} down." if flags else
                f"Readiness {r:.0f} is still low from recent training, even though overnight markers look normal.")
         opts = [("Walking", "30–45 min easy walk, ideally outdoors, plus 10 min of gentle mobility."),
                 ("Strength", "Skip today."), ("Running", "Skip today.")]
