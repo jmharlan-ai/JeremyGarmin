@@ -793,7 +793,7 @@ def workout(ms, days, report, zones):
     for i in (1, 2):
         recent += days.get((report - dt.timedelta(days=i)).isoformat(), {}).get("activities", [])
     # Garmin labels most strength sessions "anaerobic", so only load marks strength as hard.
-    hard_48h = [a for a in recent if (a.get("load") or 0) >= 180
+    hard_48h = [a for a in recent if (a.get("load") or 0) >= 150
                 or (a.get("te_label") in HARD_LABELS and a.get("type") != "strength_training")]
     yday = days.get((report - dt.timedelta(days=1)).isoformat(), {}).get("activities", [])
     strength_yday = any(a.get("type") == "strength_training" and (a.get("dur_min") or 0) >= 15 for a in yday)
