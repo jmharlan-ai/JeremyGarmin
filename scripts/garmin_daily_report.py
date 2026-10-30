@@ -354,7 +354,7 @@ def recommendations(ms, days, report):
     usual_bed = st.median(beds) if beds else None
 
     readiness = by["readiness"]["cur"]
-    hrv_bad = "hrv" in bad
+    hrv_bad = by["hrv"]["status"] == "alert"
     rhr_bad = "sleep_rhr" in bad
     recovery_flags = sum(k in bad for k in ("readiness", "hrv", "sleep_rhr", "bb_wake"))
 
