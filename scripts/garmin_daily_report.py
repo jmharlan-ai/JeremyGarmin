@@ -998,7 +998,13 @@ def main() -> int:
     ms = assess(days, report)
     recs, plan = recommendations(ms, days, report)
     wo = workout(ms, days, report, running_zones())
-    out.write_text(render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo))
+    page = render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo)
+    out.write_text(page)
+    # Standalone copy with its own document skeleton, for publishers that don't add one.
+    (out.parent / "index.html").write_text(
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1"></head><body>\n'
+        + page + "\n</body></html>\n")
     state, tone, summary, bullets = headline(ms, recs)
     result = dict(report_date=report.isoformat(), sleep_synced=isinstance(next(m for m in ms if m["key"] == "sleep_h")["cur"], (int, float)), state=state, summary=summary, bullets=bullets,
                   recommendations=[dict(title=r["title"], body=r["body"]) for r in recs],
