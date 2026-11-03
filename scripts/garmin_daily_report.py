@@ -62,8 +62,10 @@ def sql(query: str) -> list[dict]:
     return out
 
 
-def sync() -> None:
-    p = run(["history"], timeout=1800)
+def sync(since: dt.date) -> None:
+    # Bound the sync to the report window; a bare `history` back-fills every
+    # activity's detail since the archive's oldest day, which takes hours.
+    p = run(["history", "--since", since.isoformat()], timeout=1800)
     if p.returncode == 4 or "credentials" in p.stderr.lower() and p.returncode != 0:
         raise PermissionError(p.stderr.strip() or "Garmin sign-in needed")
     if p.returncode != 0:
@@ -988,7 +990,7 @@ def main() -> int:
     try:
         check_auth()
         if not args.no_sync:
-            sync()
+            sync(report - dt.timedelta(days=LOOKBACK))
         days = load(report)
     except PermissionError as e:
         out.write_text(render_error(report, f"Garmin sign-in is needed before the report can run ({e}). Ask Claude to log in to Garmin again."))
