@@ -14,6 +14,13 @@ scripts/garmin_daily_report.py                 # today (America/Los_Angeles)
 scripts/garmin_daily_report.py --date 2026-10-02 --no-sync
 ```
 
+The report also estimates target paces (threshold and zone 2) from recent run laps,
+spells out today's workout with paces and recoveries, reviews the last interval
+session against the previous one of the same kind, and shows weekly mileage, load,
+run heart-rate zones (with the 80% easy-running check), VO2 max trend, sleep
+consistency and the Garmin sign-in expiry. `--json` includes a one-line `headline`
+for phone notifications.
+
 Requires a signed-in `garmin-pp-cli` (`garmin-pp-cli auth login --email ...`).
 Exit code 4 means the Garmin sign-in has expired. Reports are git-ignored because
 they contain personal health data.
