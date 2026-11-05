@@ -1454,6 +1454,101 @@ def render_error(report, message):
 <h1>Report not generated</h1></header><div class="panel"><p>{esc(message)}</p></div></div>"""
 
 
+# ---------------------------------------------------------------- email
+
+ARTIFACT_URL = os.environ.get("GARMIN_REPORT_URL", "https://claude.ai/artifact/AzkqD7rNWL3NxYDWUocPQ1")
+
+
+def render_email(report, ms, recs, plan, wo, x, state, tone, summary, bullets):
+    """Email-client-safe version: tables and inline styles only, no scripts, fonts or SVG."""
+    by = {m["key"]: m for m in ms}
+    ink, muted, line, panel = "#14171c", "#6b7280", "#e3e6eb", "#ffffff"
+    tone_c = {"good": "#0ca30c", "warning": "#d99000", "critical": "#d03b3b"}.get(tone, "#6b7280")
+    stat_c = {"alert": "#b42f2f", "watch": "#b42f2f", "better": "#0a7a0a"}
+    font = "font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;"
+    td = f"padding:6px 8px;border-bottom:1px solid {line};{font}font-size:14px;color:{ink};"
+
+    def card(title, body):
+        return (f'<tr><td style="padding:0 0 14px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                f'style="background:{panel};border:1px solid {line};border-radius:10px"><tr><td style="padding:14px 16px;{font}color:{ink}">'
+                f'<div style="font-size:16px;font-weight:700;margin:0 0 8px">{title}</div>{body}</td></tr></table></td></tr>')
+
+    def p(t, style=""):
+        return f'<p style="margin:0 0 8px;font-size:14px;line-height:1.5;{style}">{t}</p>'
+
+    tiles = "".join(
+        f'<td width="25%" style="padding:8px;border:1px solid {line};{font}vertical-align:top">'
+        f'<div style="font-size:11px;color:{muted};text-transform:uppercase;letter-spacing:.05em">{esc(by[k]["label"])}</div>'
+        f'<div style="font-size:22px;font-weight:700;color:{ink}">{fmt(by[k]["cur"], by[k]["dec"])}'
+        f'<span style="font-size:12px;color:{muted}"> {esc(by[k]["unit"])}</span></div>'
+        f'<div style="font-size:12px;color:{muted}">7d {fmt(by[k]["a7"], by[k]["dec"])} · 30d {fmt(by[k]["a30"], by[k]["dec"])}</div>'
+        f'<div style="font-size:12px;font-weight:700;color:{stat_c.get(by[k]["status"], muted)}">{STATUS_TEXT[by[k]["status"]][1]}</div></td>'
+        for k in ("readiness", "sleep_h", "hrv", "sleep_rhr"))
+    head = (f'<tr><td style="padding:0 0 14px;{font}">'
+            f'<div style="font-size:12px;color:{muted};text-transform:uppercase;letter-spacing:.08em">Garmin morning report · {report.strftime("%A, %B %-d")}</div>'
+            f'<div style="border-left:6px solid {tone_c};padding:6px 0 6px 12px;margin-top:8px">'
+            f'<div style="font-size:26px;font-weight:800;color:{ink}">{esc(state)}</div>'
+            f'<div style="font-size:14px;color:{muted}">{esc(summary)}</div></div>'
+            + "".join(p("• " + esc(b), "color:#4b5260") for b in bullets) + '</td></tr>'
+            f'<tr><td style="padding:0 0 14px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="background:{panel};border-collapse:collapse"><tr>{tiles}</tr></table></td></tr>')
+    out = [head]
+    if wo:
+        body = p(esc(wo["why"]), f"color:{muted}") + "".join(
+            p(f'<b>{esc(o["activity"])}:</b> {esc(o["plan"])}') for o in wo["options"])
+        rm = x.get("reminders")
+        if rm:
+            body += p(f'<b>Daily:</b> {esc(rm["text"])} <span style="color:{muted}">{esc(rm["note"])}</span>')
+        out.append(card(f"Today's workout · {esc(wo['level'])}", body))
+    sc = x.get("sleep_consistency")
+    body = p(f'Lights out by <b>{plan["lights_out"]}</b> for {plan["target_h"]:.1f} h before a {plan["wake"]} wake-up.'
+             + (f' Last {sc["nights"]} nights: {sc["hit_hours"]} reached {plan["target_h"]:.1f} h, {sc["hit_bedtime"]} asleep by {sc["asleep_by"]}.'
+                if sc and sc["nights"] else ""))
+    body += "".join(p(f'<b>{esc(r["title"])}.</b> {esc(r["body"])}') for r in recs) or p(
+        "No corrections needed. Every tracked metric is at or better than your averages.")
+    out.append(card("What to do today", body))
+    tr = []
+    pc, rv, wk = x.get("paces"), x.get("review"), x.get("week")
+    if pc and pc.get("threshold"):
+        lo, hi = pc["threshold_range"]
+        z = f', zone 2 {pace(pc["z2_range"][0])}–{pace(pc["z2_range"][1])}/mi' if pc.get("z2_range") else ""
+        tr.append(p(f'<b>Target paces:</b> threshold {pace(lo)}–{pace(hi)}/mi{z}.'))
+    if rv:
+        tr.append(p(f'<b>Last hard session ({esc(rv["when"])}):</b> {esc(rv["name"])}, {esc(rv["summary"])} {esc(rv["advice"])}'
+                    + (f' {esc(rv["compare"])}' if rv.get("compare") else "")))
+    if wk:
+        e = wk["easy_pct"]
+        chk = (f' Run zones: Z1+Z2 {e:.1f}% <b style="color:{"#0a7a0a" if e >= 80 else "#b42f2f"}">'
+               f'{"✓ PASS" if e >= 80 else "✗ UNDER"}</b> vs the 80% floor.') if e is not None else ""
+        tr.append(p(f'<b>Last 7 days:</b> {wk["miles"]:.1f} mi in {wk["runs"]} runs ({wk["miles"] - wk["miles_prior"]:+.1f} mi vs prior week); '
+                    f'load {wk["acute"]:.0f} vs {wk["chronic"]:.0f} weekly average.{chk}'))
+    vo2 = x.get("vo2") or []
+    if vo2:
+        tr.append(p(f'<b>VO2 max:</b> {vo2[-1][1]:.1f} ({vo2[-1][1] - vo2[0][1]:+.1f} since {dt.date.fromisoformat(vo2[0][0]).strftime("%b %-d")}).'))
+    if tr:
+        out.append(card("Training", "".join(tr)))
+    peers = x.get("peers")
+    if peers:
+        rows = "".join(f'<tr><td style="{td}"><b>{esc(r["metric"])}</b></td><td style="{td}">{esc(r["you"])}</td>'
+                       f'<td style="{td}color:{"#0a7a0a" if r["good"] else "#b42f2f"}">{esc(r["verdict"].split(". ")[0].rstrip("."))}</td></tr>'
+                       for r in peers["rows"])
+        out.append(card(f'How you compare with men your age ({peers["age"]})',
+                        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">{rows}</table>'))
+    exp = x.get("auth_expiry")
+    if exp and (exp.date() - report).days <= 7:
+        out.append(card("Garmin sign-in expiring", p(f'Sign-in expires {exp.strftime("%a %b %-d")}. Ask Claude to sign in to Garmin again before then.')))
+    out.append(f'<tr><td style="padding:4px 0 0;{font}text-align:center">'
+               f'<a href="{esc(ARTIFACT_URL)}" style="display:inline-block;background:#2a78d6;color:#ffffff;text-decoration:none;'
+               f'font-weight:700;font-size:14px;padding:10px 18px;border-radius:8px">Open the full report with charts</a>'
+               f'<p style="font-size:11px;color:{muted};margin:12px 0 0">From Garmin Connect data. Guidance is based on your own trends, not medical advice.</p></td></tr>')
+    title = f"Garmin morning report · {report.strftime('%a %b %-d')}"
+    return (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{esc(title)}</title></head><body style="margin:0;padding:0;background:#f3f4f6">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6"><tr><td align="center" style="padding:16px 10px">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px">{"".join(out)}</table>'
+            f'</td></tr></table></body></html>')
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -1504,10 +1599,14 @@ def main() -> int:
         '<meta name="viewport" content="width=device-width,initial-scale=1"></head><body>\n'
         + page + "\n</body></html>\n")
     state, tone, summary, bullets = headline(ms, recs)
+    (out.parent / "garmin-email.html").write_text(
+        render_email(report, ms, recs, plan, wo, extras, state, tone, summary, bullets))
     result = dict(report_date=report.isoformat(), sleep_synced=isinstance(next(m for m in ms if m["key"] == "sleep_h")["cur"], (int, float)), state=state, summary=summary, bullets=bullets,
                   recommendations=[dict(title=r["title"], body=r["body"]) for r in recs],
                   tonight={k: v for k, v in plan.items() if k != "lights_out_min"}, workout=wo,
                   headline=phone_headline(state, wo, paces, recs),
+                  email_subject=f"{state} · Garmin report {report.strftime('%a %b %-d')}",
+                  email_html=str(out.parent / "garmin-email.html"),
                   paces={k: (pace(v) if isinstance(v, float) else [pace(i) for i in v] if k.endswith("_range") else v)
                          for k, v in (paces or {}).items()},
                   last_hard_session=review, week=extras["week"], sleep_consistency=extras["sleep_consistency"],
