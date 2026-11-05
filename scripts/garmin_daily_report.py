@@ -777,6 +777,9 @@ footer{font-size:12px;color:var(--muted)}
 .badge{display:inline-flex;gap:6px;align-items:center;font-weight:700;font-size:13px;padding:2px 10px;border-radius:999px;border:1.5px solid currentColor}
 .badge.pass{color:var(--good-ink)}.badge.under{color:var(--bad-ink)}
 .notice{background:var(--panel);border:1px solid var(--warn);border-left:6px solid var(--warn);border-radius:12px;padding:12px 16px}
+table.peer td{text-align:left;vertical-align:top}table.peer th{text-align:left}
+table.peer td:nth-child(4){color:var(--ink2)}
+.panel a{color:var(--accent)}
 .remind{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;font-size:14px}
 """
 
@@ -1168,6 +1171,107 @@ def workout(ms, days, report, zones, paces=None):
     return dict(level=level, why=why, options=[dict(activity=a, plan=t) for a, t in opts])
 
 
+# ---------------------------------------------------------------- peer comparison
+
+# FRIEND registry treadmill VO2 max percentiles, men (Kaminsky et al., Mayo Clin Proc 2015,
+# doi:10.1016/j.mayocp.2015.07.026). Values are the 2015 table as reproduced by secondary
+# sources; the 2022 update lowered treadmill values by 1.5-4.6 ml/kg/min.
+FRIEND_MEN = {(40, 49): [(10, 26.8), (25, 31.9), (50, 37.8), (75, 45.0), (90, 52.1)]}
+
+PEER_SOURCES = [
+    ("FRIEND registry VO2 max norms (Kaminsky 2015)", "https://doi.org/10.1016/j.mayocp.2015.07.026"),
+    ("NHANES resting pulse reference data (Ostchega 2011)", "https://pubmed.ncbi.nlm.nih.gov/21905522/"),
+    ("Daily steps and mortality, 15 cohorts (Paluch 2022)", "https://doi.org/10.1016/S2468-2667(21)00302-9"),
+]
+
+
+def profile():
+    """Sex, age and body size from Garmin's user settings."""
+    p = run(["account", "settings", "--agent", "--data-source", "live"], timeout=60)
+    try:
+        r = json.loads(p.stdout)
+        u = (r.get("results") or r).get("userData") or {}
+    except (ValueError, AttributeError, TypeError):
+        return None
+    try:
+        born = dt.date.fromisoformat(u["birthDate"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return dict(sex=u.get("gender"), born=born, weight_kg=(u.get("weight") or 0) / 1000 or None,
+                height_cm=u.get("height"))
+
+
+def percentile(v, table):
+    """Linear interpolation inside a (percentile, value) table; '>90th' style outside it."""
+    if v <= table[0][1]:
+        return f"below the {table[0][0]}th percentile"
+    if v >= table[-1][1]:
+        return f"above the {table[-1][0]}th percentile"
+    for (p0, v0), (p1, v1) in zip(table, table[1:]):
+        if v0 <= v <= v1:
+            return f"about the {p0 + (v - v0) / (v1 - v0) * (p1 - p0):.0f}th percentile"
+
+
+def peer_comparison(prof, ms, vo2, report):
+    if not prof or prof.get("sex") != "MALE":
+        return None
+    age = report.year - prof["born"].year - ((report.month, report.day) < (prof["born"].month, prof["born"].day))
+    by = {m["key"]: m for m in ms}
+    rows = []
+    band = next((b for b in FRIEND_MEN if b[0] <= age <= b[1]), None)
+    if vo2 and band:
+        v = vo2[-1][1]
+        t = FRIEND_MEN[band]
+        rows.append(dict(metric="VO2 max", you=f"{v:.1f} ml/kg/min",
+                         peers=f"median {t[2][1]:.1f}; 90th percentile {t[-1][1]:.1f} (men {band[0]}–{band[1]})",
+                         verdict=percentile(v, t).capitalize() + ". Garmin's figure is an estimate from runs, not a lab test.",
+                         good=v >= t[2][1]))
+    rhr = by["sleep_rhr"]["a30"]
+    if isinstance(rhr, (int, float)):
+        rows.append(dict(metric="Resting heart rate", you=f"{rhr:.0f} bpm (30-day avg)",
+                         peers="mean 71 bpm (US men 20+); 15% of men are under 60",
+                         verdict=f"{71 - rhr:.0f} bpm below the average man, typical of trained endurance athletes. "
+                                 "Garmin's overnight low reads lower than a seated clinic pulse.",
+                         good=rhr < 71))
+    steps = by["steps"]["a30"]
+    if isinstance(steps, (int, float)):
+        rows.append(dict(metric="Daily steps", you=f"{steps:,.0f} (30-day avg)",
+                         peers="mortality benefit levels off at 8,000–10,000 under age 60",
+                         verdict=("Above the range where more steps stopped lowering mortality risk." if steps >= 10000
+                                  else "Inside the range where the benefit levels off." if steps >= 8000
+                                  else "Below the 8,000–10,000 range linked to the lowest mortality risk."),
+                         good=steps >= 8000))
+    sleep = by["sleep_h"]["a30"]
+    if isinstance(sleep, (int, float)):
+        rows.append(dict(metric="Sleep", you=f"{sleep:.1f} h (30-day avg)", peers="7 h or more recommended for adults",
+                         verdict="Meets the recommendation." if sleep >= 7 else "Short of the 7-hour recommendation.",
+                         good=sleep >= 7))
+    w, h = prof.get("weight_kg"), prof.get("height_cm")
+    if w and h:
+        bmi = w / (h / 100) ** 2
+        rows.append(dict(metric="BMI", you=f"{bmi:.1f} ({w * 2.20462:.0f} lb, {h / 2.54:.0f} in)",
+                         peers="healthy range 18.5–24.9",
+                         verdict="In the healthy range." if 18.5 <= bmi < 25 else "Outside the healthy range.",
+                         good=18.5 <= bmi < 25))
+    return dict(age=age, rows=rows) if rows else None
+
+
+def peer_section(peers):
+    if not peers:
+        return ""
+    rows = "".join(
+        f'<tr><td>{esc(r["metric"])}</td><td class="num">{esc(r["you"])}</td><td>{esc(r["peers"])}</td>'
+        f'<td><span class="pill {"better" if r["good"] else "watch"}">{"▲" if r["good"] else "▽"}</span> {esc(r["verdict"])}</td></tr>'
+        for r in peers["rows"])
+    src = " · ".join(f'<a href="{esc(u)}" target="_blank" rel="noopener">{esc(n)}</a>' for n, u in PEER_SOURCES)
+    return (f'<section><h2>How you compare with men your age ({peers["age"]})</h2><div class="panel tbl"><table class="peer">'
+            '<thead><tr><th>Metric</th><th>You</th><th>Reference</th><th>Where you stand</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+            '<p class="muted" style="margin:8px 0 0;font-size:12px">HRV is left out: the published age norms come from '
+            'short daytime ECGs, which don\'t compare fairly with Garmin\'s overnight readings. '
+            f'Sources: {src}. Sleep and BMI ranges are the standard CDC adult guidelines.</p></div></section>')
+
+
 def training_section(x):
     paces, review, week, vo2 = x.get("paces"), x.get("review"), x.get("week"), x.get("vo2") or []
     if not (paces or review or week or vo2):
@@ -1311,6 +1415,7 @@ def render(report, days, ms, recs, plan, generated, wo=None, x=None):
 <div class="recs">{rec_html}</div></section>
 
 {training_html}
+{peer_section(x.get("peers"))}
 <section><h2>How the last 24 hours compare</h2>
 <div class="panel"><div class="legend"><span><i style="background:var(--bad)"></i>Worse than 30-day avg</span>
 <span><i style="background:var(--good)"></i>Better</span><span><i style="background:var(--neutral)"></i>Within normal range</span>
@@ -1390,6 +1495,7 @@ def main() -> int:
     extras = dict(paces=paces, review=review, week=week_summary(days, report, zones),
                   vo2=vo2_series(report), sleep_consistency=sleep_consistency(days, report, plan),
                   reminders=reminders(days, report), auth_expiry=auth_info())
+    extras["peers"] = peer_comparison(profile(), ms, extras["vo2"], report)
     page = render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo, extras)
     out.write_text(page)
     # Standalone copy with its own document skeleton, for publishers that don't add one.
@@ -1405,7 +1511,7 @@ def main() -> int:
                   paces={k: (pace(v) if isinstance(v, float) else [pace(i) for i in v] if k.endswith("_range") else v)
                          for k, v in (paces or {}).items()},
                   last_hard_session=review, week=extras["week"], sleep_consistency=extras["sleep_consistency"],
-                  reminders=extras["reminders"],
+                  reminders=extras["reminders"], peers=extras["peers"],
                   vo2max=extras["vo2"][-1][1] if extras["vo2"] else None,
                   garmin_signin_expires=extras["auth_expiry"].isoformat() if extras["auth_expiry"] else None,
                   metrics=[{k: m.get(k) for k in ("label", "cur", "a7", "a30", "status", "unit")} for m in ms])

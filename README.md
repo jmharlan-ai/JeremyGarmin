@@ -18,7 +18,8 @@ The report also estimates target paces (threshold and zone 2) from recent run la
 spells out today's workout with paces and recoveries, reviews the last interval
 session against the previous one of the same kind, and shows weekly mileage, load,
 run heart-rate zones (with the 80% easy-running check), VO2 max trend, sleep
-consistency and the Garmin sign-in expiry. `--json` includes a one-line `headline`
+consistency, the Garmin sign-in expiry, and how VO2 max, resting heart
+rate, steps, sleep and BMI compare with men your age (sourced norms). `--json` includes a one-line `headline`
 for phone notifications.
 
 Requires a signed-in `garmin-pp-cli` (`garmin-pp-cli auth login --email ...`).
