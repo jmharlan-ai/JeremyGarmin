@@ -1071,6 +1071,8 @@ def phone_headline(state, wo, paces, recs):
     if wo and wo["level"] == "Quality" and paces and paces.get("threshold"):
         lo, hi = paces["threshold_range"]
         w = f"Quality day: 3 × 8 min at {pace(lo)}–{pace(hi)}/mi"
+    elif wo and wo["level"] == "Done":
+        w = "Main session done, keep the rest easy"
     elif wo:
         w = f"{wo['level']} day"
     else:
