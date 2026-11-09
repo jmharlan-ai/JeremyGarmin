@@ -1173,6 +1173,196 @@ def workout(ms, days, report, zones, paces=None):
     return dict(level=level, why=why, options=[dict(activity=a, plan=t) for a, t in opts])
 
 
+# ---------------------------------------------------------------- body composition
+
+LB = 2.20462 / 1000  # grams -> pounds
+TARGET_RATE = (-0.75, -0.5)  # lb/week fat-loss target while keeping muscle
+
+
+def weight_history(report, days=91):
+    """Index-scale weigh-ins from Garmin's weight service.
+
+    garmin-pp-cli has no weight command, so this calls the same Garmin API the
+    CLI uses, with the CLI's stored sign-in. Returns [] if anything fails."""
+    import tomllib
+    import ssl
+    import urllib.error
+    import urllib.request
+    path = Path(os.environ.get("GARMIN_CREDENTIALS", "~/.local/share/garmin-pp-cli/credentials.toml")).expanduser()
+    start = (report - dt.timedelta(days=days)).isoformat()
+    url = (f"https://connectapi.garmin.com/weight-service/weight/dateRange"
+           f"?startDate={start}&endDate={report.isoformat()}")
+    ca = os.environ.get("SSL_CERT_FILE") or ("/root/.ccr/ca-bundle.crt" if Path("/root/.ccr/ca-bundle.crt").exists() else None)
+    ctx = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+    for attempt in (1, 2):
+        try:
+            token = tomllib.loads(path.read_text())["access_token"]
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {token}", "DI-Backend": "connectapi.garmin.com",
+                "User-Agent": "GCM-iOS-5.7.2.1", "Accept": "application/json"})
+            data = json.load(urllib.request.urlopen(req, context=ctx, timeout=60))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and attempt == 1:
+                # Let the CLI refresh its token with a cheap live call, then retry.
+                run(["fitness", "age", "x", "--date", report.isoformat(), "--agent", "--data-source", "live"], timeout=60)
+                continue
+            return []
+        except (OSError, ValueError, KeyError):
+            return []
+    out = []
+    for r in data.get("dateWeightList") or []:
+        w, d = r.get("weight"), r.get("calendarDate")
+        if not (isinstance(w, (int, float)) and w > 0 and isinstance(d, str)):
+            continue
+        bf = r.get("bodyFat")
+        bf = bf if isinstance(bf, (int, float)) and bf > 0 else None
+        out.append(dict(d=d, lb=w * LB, bf=bf, lean=(w * LB * (1 - bf / 100)) if bf else None))
+    out.sort(key=lambda r: r["d"])
+    return out
+
+
+def body_comp(weighins, report, weeks=13):
+    """Weekly (Monday-start) averages for the last `weeks` weeks, plus trend."""
+    if not weighins:
+        return None
+    monday = report - dt.timedelta(days=report.weekday())
+    starts = [monday - dt.timedelta(weeks=i) for i in range(weeks - 1, -1, -1)]
+    rows = []
+    for ws in starts:
+        we = ws + dt.timedelta(days=6)
+        wk = [r for r in weighins if ws.isoformat() <= r["d"] <= we.isoformat()]
+        if not wk:
+            rows.append(dict(week=ws.isoformat(), n=0, lb=None, bf=None, lean=None, fat=None))
+            continue
+        bfs = [r["bf"] for r in wk if r["bf"]]
+        leans = [r["lean"] for r in wk if r["lean"]]
+        lb = st.mean(r["lb"] for r in wk)
+        bf = st.mean(bfs) if bfs else None
+        rows.append(dict(week=ws.isoformat(), n=len(wk), lb=lb, bf=bf, lean=st.mean(leans) if leans else None,
+                         fat=(lb * bf / 100) if bf else None))
+    have = [r for r in rows if r["lb"] is not None]
+    if len(have) < 2:
+        return dict(weeks=rows, latest=weighins[-1])
+
+    def slope(pts):
+        # Least-squares lb/week over (week index, value) pairs.
+        if len(pts) < 2:
+            return None
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        mx, my = st.mean(xs), st.mean(ys)
+        den = sum((x - mx) ** 2 for x in xs)
+        return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+    idx = {r["week"]: i for i, r in enumerate(rows)}
+    # The current week is partial; the rate uses the last 4 weeks that have weigh-ins.
+    recent = [(idx[r["week"]], r["lb"]) for r in have[-4:]]
+    rate = slope(recent)
+    first, last = have[0], have[-1]
+
+    def delta(key):
+        a = next((r[key] for r in have if r[key] is not None), None)
+        b = next((r[key] for r in reversed(have) if r[key] is not None), None)
+        return (b - a) if a is not None and b is not None else None
+
+    if rate is None:
+        verdict, tone = "Not enough weigh-ins for a trend yet.", "steady"
+    elif rate < -1.0:
+        verdict, tone = (f"Losing {abs(rate):.1f} lb/week, faster than the 0.5–0.75 target. Eat a little more "
+                         f"(about 150–250 kcal a day) to protect muscle."), "watch"
+    elif rate <= -0.4:
+        verdict, tone = f"Losing {abs(rate):.1f} lb/week, inside the 0.5–0.75 lb/week target. Keep going.", "better"
+    elif rate < -0.1:
+        verdict, tone = (f"Losing {abs(rate):.1f} lb/week, a little slower than the 0.5–0.75 target. Trim about "
+                         f"150 kcal a day if you want the target pace."), "steady"
+    else:
+        verdict, tone = (f"Weight is flat or rising ({rate:+.1f} lb/week over the last 4 weeks). For fat loss, "
+                         f"cut about 300 kcal a day, mostly on easy and rest days."), "watch"
+    dlean = delta("lean")
+    if dlean is not None and dlean <= -1.5 and (delta("fat") or 0) < 0:
+        verdict += (f" Lean mass is down {abs(dlean):.1f} lb since {dt.date.fromisoformat(first['week']).strftime('%b %-d')}: "
+                    f"push protein toward 150 g a day and keep lifting heavy.")
+    return dict(weeks=rows, latest=weighins[-1], rate=rate, verdict=verdict, tone=tone,
+                d_lb=delta("lb"), d_bf=delta("bf"), d_lean=dlean, d_fat=delta("fat"),
+                since=first["week"], n=len(weighins))
+
+
+def weight_chart(bc, weighins):
+    """Weekly average weight (line) over 13 weeks with each weigh-in as a faint dot."""
+    rows = bc["weeks"]
+    W, H, L, R, T, B = 520, 190, 40, 12, 14, 26
+    pts = [r["lb"] for r in rows if r["lb"] is not None] + [w["lb"] for w in weighins]
+    lo, hi, ticks = nice_range(min(pts) - 0.5, max(pts) + 0.5)
+    n = len(rows)
+    step = (W - L - R) / max(n - 1, 1)
+    w0 = dt.date.fromisoformat(rows[0]["week"])
+    x_week = lambda i: L + i * step
+    x_day = lambda d: L + (dt.date.fromisoformat(d) - w0).days / 7 * step
+    y = lambda v: T + (hi - v) * (H - T - B) / (hi - lo)
+    g = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="Weekly average weight, last 13 weeks">']
+    for t in ticks:
+        g.append(f'<line x1="{L}" x2="{W-R}" y1="{y(t):.1f}" y2="{y(t):.1f}" class="grid"/>'
+                 f'<text x="{L-6}" y="{y(t)+3.5:.1f}" class="tick" text-anchor="end">{t:g}</text>')
+    for wi in weighins:
+        if wi["d"] >= rows[0]["week"]:
+            g.append(f'<circle cx="{x_day(wi["d"]):.1f}" cy="{y(wi["lb"]):.1f}" r="2" class="pt" opacity=".35"/>')
+    line = [(x_week(i), y(r["lb"])) for i, r in enumerate(rows) if r["lb"] is not None]
+    g.append('<path d="' + " ".join(f"{'M' if k == 0 else 'L'}{px:.1f},{py:.1f}" for k, (px, py) in enumerate(line)) + '" class="s-roll"/>')
+    for i, r in enumerate(rows):
+        lab = dt.date.fromisoformat(r["week"]).strftime("%b %-d")
+        if r["lb"] is not None:
+            tip = f"Week of {lab}: {r['lb']:.1f} lb avg" + (f" · {r['bf']:.1f}% body fat" if r["bf"] else "") + f" · {r['n']} weigh-ins"
+            g.append(f'<circle cx="{x_week(i):.1f}" cy="{y(r["lb"]):.1f}" r="{4.5 if i == n - 1 else 3}" class="{"pt-last" if i == n - 1 else "pt"}"/>'
+                     f'<circle cx="{x_week(i):.1f}" cy="{y(r["lb"]):.1f}" r="10" class="hit" data-tip="{esc(tip)}"/>')
+        if i % 3 == 0 or i == n - 1:
+            anchor = "start" if i == 0 else "end" if i == n - 1 else "middle"
+            g.append(f'<text x="{x_week(i):.1f}" y="{H-6}" class="tick" text-anchor="{anchor}">{lab}</text>')
+    first = next(((i, r) for i, r in enumerate(rows) if r["lb"] is not None), None)
+    last = next(((i, r) for i, r in reversed(list(enumerate(rows))) if r["lb"] is not None), None)
+    for (i, r), anchor, dx in ((first, "start", 6), (last, "end", -6)):
+        g.append(f'<text x="{x_week(i) + dx:.1f}" y="{y(r["lb"]) - 8:.1f}" class="val" text-anchor="{anchor}">{r["lb"]:.1f}</text>')
+    g.append("</svg>")
+    return "".join(g)
+
+
+def body_comp_section(bc, weighins):
+    if not bc:
+        return ('<section><h2>Body composition</h2><div class="panel muted">No weigh-ins could be read from Garmin '
+                'for the last 3 months.</div></section>')
+    lt = bc["latest"]
+    kv = [f'<dt>Latest</dt><dd>{lt["lb"]:.1f} lb' + (f' · {lt["bf"]:.1f}% body fat' if lt["bf"] else "")
+          + f' ({dt.date.fromisoformat(lt["d"]).strftime("%b %-d")})</dd>']
+    if bc.get("d_lb") is not None:
+        since = dt.date.fromisoformat(bc["since"]).strftime("%b %-d")
+        parts = [f'weight {bc["d_lb"]:+.1f} lb']
+        if bc.get("d_fat") is not None:
+            parts.append(f'fat {bc["d_fat"]:+.1f} lb')
+        if bc.get("d_lean") is not None:
+            parts.append(f'lean {bc["d_lean"]:+.1f} lb')
+        if bc.get("d_bf") is not None:
+            parts.append(f'body fat {bc["d_bf"]:+.1f} pts')
+        kv.append(f'<dt>Since {since}</dt><dd>{", ".join(parts)}</dd>')
+    if bc.get("rate") is not None:
+        kv.append(f'<dt>Rate</dt><dd>{bc["rate"]:+.2f} lb/week (last 4 weeks) · target −0.50 to −0.75</dd>')
+    verdict = (f'<p style="margin:0"><span class="pill {bc.get("tone", "steady")}">'
+               f'{STATUS_TEXT.get(bc.get("tone", "steady"), ("●", ""))[0]}</span> {esc(bc.get("verdict", ""))}</p>')
+    bf_rows = "".join(
+        f'<tr><td>{dt.date.fromisoformat(r["week"]).strftime("%b %-d")}</td><td class="num">{fmt(r["lb"], 1)}</td>'
+        f'<td class="num">{fmt(r["bf"], 1)}</td><td class="num">{fmt(r["lean"], 1)}</td><td class="num">{r["n"]}</td></tr>'
+        for r in reversed(bc["weeks"]) if r["n"])
+    return ('<section><h2>Body composition · last 13 weeks</h2><div class="grid2">'
+            f'<div class="panel" style="display:flex;flex-direction:column;gap:8px"><h3>Weekly average weight (lb)</h3>'
+            f'<div class="legend"><span><i class="line" style="background:var(--roll)"></i>Weekly average</span>'
+            f'<span><i style="background:var(--c1);opacity:.35;width:8px;height:8px;border-radius:50%"></i>Each weigh-in</span></div>'
+            f'{weight_chart(bc, weighins)}</div>'
+            f'<div class="panel" style="display:flex;flex-direction:column;gap:8px"><dl class="kv">{"".join(kv)}</dl>{verdict}'
+            f'<div class="tbl" style="max-height:220px;overflow-y:auto"><table style="min-width:0">'
+            f'<thead><tr><th>Week of</th><th>Weight</th><th>Body fat %</th><th>Lean lb</th><th>Weigh-ins</th></tr></thead>'
+            f'<tbody>{bf_rows}</tbody></table></div>'
+            '<p class="muted" style="margin:0;font-size:12px">From your Index scale. Scale body fat varies 1–2 points with '
+            'hydration, so read the weekly trend, not single days.</p></div></div></section>')
+
+
 # ---------------------------------------------------------------- peer comparison
 
 # FRIEND registry treadmill VO2 max percentiles, men (Kaminsky et al., Mayo Clin Proc 2015,
@@ -1417,6 +1607,7 @@ def render(report, days, ms, recs, plan, generated, wo=None, x=None):
 <div class="recs">{rec_html}</div></section>
 
 {training_html}
+{body_comp_section(x.get("body_comp"), x.get("weighins") or []) if "body_comp" in x else ""}
 {peer_section(x.get("peers"))}
 <section><h2>How the last 24 hours compare</h2>
 <div class="panel"><div class="legend"><span><i style="background:var(--bad)"></i>Worse than 30-day avg</span>
@@ -1529,6 +1720,31 @@ def render_email(report, ms, recs, plan, wo, x, state, tone, summary, bullets):
         tr.append(p(f'<b>VO2 max:</b> {vo2[-1][1]:.1f} ({vo2[-1][1] - vo2[0][1]:+.1f} since {dt.date.fromisoformat(vo2[0][0]).strftime("%b %-d")}).'))
     if tr:
         out.append(card("Training", "".join(tr)))
+    bc = x.get("body_comp")
+    if bc and bc.get("weeks"):
+        have = [r for r in bc["weeks"] if r["lb"] is not None]
+        top = max(r["lb"] for r in have)
+        bot = min(r["lb"] for r in have)
+        span = max(top - bot, 0.5)
+        bars = "".join(
+            f'<tr><td style="{td}white-space:nowrap">{dt.date.fromisoformat(r["week"]).strftime("%b %-d")}</td>'
+            f'<td style="{td}width:60%"><div style="background:#2a78d6;height:10px;border-radius:3px;'
+            f'width:{20 + 80 * (r["lb"] - bot) / span:.0f}%"></div></td>'
+            f'<td style="{td}text-align:right;white-space:nowrap">{r["lb"]:.1f} lb'
+            + (f' · {r["bf"]:.1f}%' if r["bf"] else "") + '</td></tr>'
+            for r in bc["weeks"] if r["lb"] is not None)
+        body = ""
+        if bc.get("rate") is not None:
+            body += p(f'<b>{bc["rate"]:+.2f} lb/week</b> over the last 4 weeks (target −0.50 to −0.75). {esc(bc.get("verdict", ""))}')
+        if bc.get("d_lb") is not None:
+            since = dt.date.fromisoformat(bc["since"]).strftime("%b %-d")
+            body += p(f'Since {since}: weight {bc["d_lb"]:+.1f} lb'
+                      + (f', fat {bc["d_fat"]:+.1f} lb' if bc.get("d_fat") is not None else "")
+                      + (f', lean {bc["d_lean"]:+.1f} lb' if bc.get("d_lean") is not None else "") + '.', f"color:{muted}")
+        body += (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">{bars}</table>'
+                 f'<p style="margin:6px 0 0;font-size:11px;color:{muted}">Weekly average weight and body fat from your Index scale. '
+                 f'Bars are scaled from {bot:.1f} to {top:.1f} lb.</p>')
+        out.append(card("Body composition · weekly average", body))
     peers = x.get("peers")
     if peers:
         rows = "".join(f'<tr><td style="{td}"><b>{esc(r["metric"])}</b></td><td style="{td}">{esc(r["you"])}</td>'
@@ -1593,6 +1809,8 @@ def main() -> int:
                   vo2=vo2_series(report), sleep_consistency=sleep_consistency(days, report, plan),
                   reminders=reminders(days, report), auth_expiry=auth_info())
     extras["peers"] = peer_comparison(profile(), ms, extras["vo2"], report)
+    extras["weighins"] = weight_history(report)
+    extras["body_comp"] = body_comp(extras["weighins"], report)
     page = render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo, extras)
     out.write_text(page)
     # Standalone copy with its own document skeleton, for publishers that don't add one.
@@ -1613,6 +1831,7 @@ def main() -> int:
                          for k, v in (paces or {}).items()},
                   last_hard_session=review, week=extras["week"], sleep_consistency=extras["sleep_consistency"],
                   reminders=extras["reminders"], peers=extras["peers"],
+                  body_comp={k: v for k, v in (extras["body_comp"] or {}).items() if k != "weeks"} or None,
                   vo2max=extras["vo2"][-1][1] if extras["vo2"] else None,
                   garmin_signin_expires=extras["auth_expiry"].isoformat() if extras["auth_expiry"] else None,
                   metrics=[{k: m.get(k) for k in ("label", "cur", "a7", "a30", "status", "unit")} for m in ms])
