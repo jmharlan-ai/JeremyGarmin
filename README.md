@@ -20,7 +20,10 @@ session against the previous one of the same kind, and shows weekly mileage, loa
 run heart-rate zones (with the 80% easy-running check), VO2 max trend, sleep
 consistency, the Garmin sign-in expiry, and how VO2 max, resting heart
 rate, steps, sleep and BMI compare with men your age (sourced norms), plus a 13-week body-composition chart from the Index
-scale (read from Garmin's weight service with the CLI's stored sign-in). `--json` includes a one-line `headline`
+scale (read from Garmin's weight service with the CLI's stored sign-in), and a
+nutrition section from Apple Health (MyNetDiary) exports that Health Auto Export
+saves to Google Drive; the morning task copies the newest export into
+`reports/nutrition/` before running the script. `--json` includes a one-line `headline`
 for phone notifications.
 
 Requires a signed-in `garmin-pp-cli` (`garmin-pp-cli auth login --email ...`).
