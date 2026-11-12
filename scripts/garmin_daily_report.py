@@ -1267,23 +1267,38 @@ def body_comp(weighins, report, weeks=13):
 
     if rate is None:
         verdict, tone = "Not enough weigh-ins for a trend yet.", "steady"
-    elif rate < -1.0:
-        verdict, tone = (f"Losing {abs(rate):.1f} lb/week, faster than the 0.5–0.75 target. Eat a little more "
-                         f"(about 150–250 kcal a day) to protect muscle."), "watch"
-    elif rate <= -0.4:
-        verdict, tone = f"Losing {abs(rate):.1f} lb/week, inside the 0.5–0.75 lb/week target. Keep going.", "better"
-    elif rate < -0.1:
-        verdict, tone = (f"Losing {abs(rate):.1f} lb/week, a little slower than the 0.5–0.75 target. Trim about "
-                         f"150 kcal a day if you want the target pace."), "steady"
     else:
-        verdict, tone = (f"Weight is flat or rising ({rate:+.1f} lb/week over the last 4 weeks). For fat loss, "
-                         f"cut about 300 kcal a day, mostly on easy and rest days."), "watch"
-    dlean = delta("lean")
-    if dlean is not None and dlean <= -1.5 and (delta("fat") or 0) < 0:
-        verdict += (f" Lean mass is down {abs(dlean):.1f} lb since {dt.date.fromisoformat(first['week']).strftime('%b %-d')}: "
-                    f"push protein toward 150 g a day and keep lifting heavy.")
+        r = round(rate, 2)  # judge the same number the page shows
+        if r < -1.0:
+            verdict, tone = (f"Losing {abs(r):.2f} lb/week, well over the 0.50-0.75 target. Eat about 250 kcal a day "
+                             f"more to protect muscle."), "watch"
+        elif r < -0.75:
+            verdict, tone = (f"Losing {abs(r):.2f} lb/week, a little faster than the 0.50-0.75 target. Eat about "
+                             f"150 kcal a day more."), "watch"
+        elif r <= -0.5:
+            verdict, tone = f"Losing {abs(r):.2f} lb/week, inside the 0.50-0.75 lb/week target.", "better"
+        elif r < -0.1:
+            verdict, tone = (f"Losing {abs(r):.2f} lb/week, a little slower than the 0.50-0.75 target. Trim about "
+                             f"150 kcal a day if you want the target pace."), "steady"
+        else:
+            verdict, tone = (f"Weight is flat or rising ({r:+.2f} lb/week over the last 4 weeks). For fat loss, "
+                             f"cut about 300 kcal a day, mostly on easy and rest days."), "watch"
+    dlean, dfat, dlb = delta("lean"), delta("fat"), delta("lb")
+    since = dt.date.fromisoformat(first["week"]).strftime("%b %-d")
+    if dlean is not None and dlean <= -1.5 and dlb is not None and dlb < 0:
+        share = dlean / dlb  # fraction of the loss that is lean mass
+        if share > 0.5:
+            tone = "watch"
+            verdict += (f" More than half the loss since {since} is lean mass ({abs(dlean):.1f} of {abs(dlb):.1f} lb). "
+                        f"Slow down to about 0.5 lb/week: eat 150-200 kcal a day more, mostly on training days, "
+                        f"get protein to about 150 g a day and keep lifting heavy.")
+        else:
+            verdict += (f" Lean mass is down {abs(dlean):.1f} lb since {since}: keep protein near 150 g a day "
+                        f"and keep lifting heavy.")
+    elif rate is not None and tone == "better":
+        verdict += " Keep going."
     return dict(weeks=rows, latest=weighins[-1], rate=rate, verdict=verdict, tone=tone,
-                d_lb=delta("lb"), d_bf=delta("bf"), d_lean=dlean, d_fat=delta("fat"),
+                d_lb=dlb, d_bf=delta("bf"), d_lean=dlean, d_fat=dfat,
                 since=first["week"], n=len(weighins))
 
 
