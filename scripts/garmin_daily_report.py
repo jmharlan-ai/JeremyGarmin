@@ -1394,6 +1394,17 @@ NUTRIENTS = {
 }
 
 
+HK_TYPES = {"dietaryenergyconsumed": "kcal", "dietaryprotein": "protein", "dietarycarbohydrates": "carbs",
+            "dietaryfattotal": "fat", "dietaryfiber": "fiber", "dietarywater": "water"}
+
+
+def _hk_label(t):
+    """dietarySodium -> Sodium, dietaryFatSaturated -> Fat saturated."""
+    import re
+    words = re.sub(r"(?<!^)(?=[A-Z])", " ", t.replace("dietary", "", 1)).strip()
+    return words[:1].upper() + words[1:].lower()
+
+
 def _nutrient_key(name):
     n = name.strip().lower()
     for key, names in NUTRIENTS.items():
@@ -1432,6 +1443,32 @@ def load_nutrition(directory=NUTRITION_DIR):
                             got[d][key] += q * scale
             else:
                 rows = list(csv.DictReader(io.StringIO(f.read_text())))
+                cols = {c.strip().lower() for c in (rows[0].keys() if rows else []) if c}
+                if {"type", "value", "date"} <= cols:
+                    # Long format: one row per nutrient; prefer each day's "daily total" row over summed entries.
+                    totals, entries = {}, {}
+                    for r in rows:
+                        r = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
+                        d, t = _day(r.get("date")), r.get("type", "")
+                        try:
+                            q = float(r.get("value"))
+                        except (TypeError, ValueError):
+                            continue
+                        unit = r.get("unit", "")
+                        key = HK_TYPES.get(t.lower()) or ("x:" + _hk_label(t) + "|" + unit if t.lower().startswith("dietary") else None)
+                        if not d or not key:
+                            continue
+                        if key == "kcal" and unit.lower() == "kj":
+                            q /= 4.184
+                        bucket = totals if "total" in r.get("source/time", "").lower() else entries
+                        bucket.setdefault(d, {}).setdefault(key, 0.0)
+                        bucket[d][key] += q
+                    for d in set(totals) | set(entries):
+                        merged = dict(entries.get(d, {}))
+                        merged.update(totals.get(d, {}))
+                        got[d] = merged
+                    days.update(got)
+                    continue
                 for r in rows:
                     d = _day(r.get("Date/Time") or r.get("Date") or r.get("date"))
                     if not d:
@@ -1494,7 +1531,8 @@ def nutrition_summary(food, burn, report, bc=None, weight_lb=None):
     out = dict(stale=False, logged7=len(w7), logged30=len(w30), kcal7=kcal7, kcal30=avg(w30, "kcal"),
                burn7=st.mean([b for _, _, b in w7 if b]) if any(b for _, _, b in w7) else None,
                deficit7=deficit, predicted_rate=predicted, protein7=prot7, protein30=avg(w30, "protein"),
-               protein_days=prot_days, macro=macro, fiber7=avg(w7, "fiber"),
+               protein_days=prot_days, macro=macro, fiber7=avg(w7, "fiber"), water7=avg(w7, "water"),
+               extras={k[2:]: avg(w7, k) for k in sorted({k for _, f, _ in w7 for k in f if k.startswith("x:")})},
                protein_per_kg=(prot7 / (weight_lb / 2.20462)) if prot7 and weight_lb else None)
     tips = []
     if prot7 is not None and prot7 < PROTEIN_TARGET_G - 10:
@@ -1519,10 +1557,13 @@ def nutrition_summary(food, burn, report, bc=None, weight_lb=None):
             tips.append(f"The logs predict {predicted:+.2f} lb/week but the scale shows {bc['rate']:+.2f}. "
                         + ("Some intake may be going unlogged, or Garmin overestimates your burn." if gap > 0
                            else "Garmin may underestimate your burn, or the logs overcount."))
+    if macro and macro["protein"] < 20:
+        tips.append(f"Only {macro['protein']:.0f}% of calories came from protein. Swapping one carb-heavy snack for "
+                    f"Greek yogurt, eggs, cottage cheese or a shake moves it toward 25-30%.")
     if out["fiber7"] is not None and out["fiber7"] < 30:
         tips.append(f"Fiber averaged {out['fiber7']:.0f} g; 30-38 g a day is the usual target for men.")
     if len(w7) < 6:
-        tips.append(f"Only {len(w7)} of the last 7 days are logged, so treat the averages as rough.")
+        tips.append(f"Only {len(w7)} of the last 7 days {'is' if len(w7) == 1 else 'are'} logged, so treat the averages as rough.")
     out["tips"] = tips
     return out
 
@@ -1578,7 +1619,7 @@ def nutrition_section(nu, food, burn, report):
         return (f'<section><h2>Nutrition</h2><div class="panel muted">No meals logged in the last 7 days '
                 f'(latest logged day {esc(nu["last"])}). Check that MyNetDiary is still writing to Apple Health and the '
                 f'export is running.</div></section>')
-    kv = [f'<dt>Eaten</dt><dd>{nu["kcal7"]:,.0f} kcal/day (7-day avg, {nu["logged7"]} days logged)</dd>']
+    kv = [f'<dt>Eaten</dt><dd>{nu["kcal7"]:,.0f} kcal/day (7-day avg, {nu["logged7"]} day{"s" if nu["logged7"] != 1 else ""} logged)</dd>']
     if nu.get("burn7"):
         kv.append(f'<dt>Burned</dt><dd>{nu["burn7"]:,.0f} kcal/day (Garmin)</dd>')
     if nu.get("deficit7") is not None:
@@ -1591,6 +1632,12 @@ def nutrition_section(nu, food, burn, report):
         kv.append(f'<dt>Macros</dt><dd>{m["protein"]:.0f}% protein · {m["carbs"]:.0f}% carbs · {m["fat"]:.0f}% fat</dd>')
     if nu.get("fiber7") is not None:
         kv.append(f'<dt>Fiber</dt><dd>{nu["fiber7"]:.0f} g/day</dd>')
+    if nu.get("water7") is not None:
+        kv.append(f'<dt>Water</dt><dd>{nu["water7"]:.1f} L/day ({nu["water7"] * 33.814:.0f} fl oz)</dd>')
+    for label, v in (nu.get("extras") or {}).items():
+        name, unit = label.split("|", 1)
+        if v is not None:
+            kv.append(f'<dt>{esc(name)}</dt><dd>{v:,.0f} {esc(unit)}/day</dd>')
     tips = "".join(f'<li>{esc(t)}</li>' for t in nu["tips"])
     return ('<section><h2>Nutrition · from MyNetDiary via Apple Health</h2><div class="grid2">'
             '<div class="panel" style="display:flex;flex-direction:column;gap:8px"><h3>Calories eaten vs burned · last 14 days</h3>'
@@ -1993,6 +2040,8 @@ def render_email(report, ms, recs, plan, wo, x, state, tone, summary, bullets):
                  + (f' vs {nu["burn7"]:,.0f} burned, {nu["deficit7"]:+,.0f} kcal/day' if nu.get("deficit7") is not None else "")]
         if nu.get("protein7") is not None:
             lines.append(f'<b>Protein:</b> {nu["protein7"]:.0f} g/day, target {PROTEIN_TARGET_G} g hit {nu["protein_days"]}/{nu["logged7"]} days')
+        if nu.get("water7") is not None:
+            lines.append(f'<b>Water:</b> {nu["water7"]:.1f} L/day')
         if nu.get("macro"):
             m = nu["macro"]
             lines.append(f'<b>Macros:</b> {m["protein"]:.0f}% protein · {m["carbs"]:.0f}% carbs · {m["fat"]:.0f}% fat')
