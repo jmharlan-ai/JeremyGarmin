@@ -142,7 +142,8 @@ def load(report: dt.date) -> dict[str, dict]:
         json_extract(data,'$.aerobicTrainingEffect') te,
         json_extract(data,'$.trainingEffectLabel') te_label,
         json_extract(data,'$.activityId') aid,
-        json_extract(data,'$.distance')/1609.344 mi
+        json_extract(data,'$.distance')/1609.344 mi,
+        json_extract(data,'$.calories') kcal
       FROM resources WHERE resource_type='activities'
         AND substr(json_extract(data,'$.startTimeLocal'),1,10) BETWEEN '{start}' AND '{end}'
       ORDER BY start""")
@@ -1651,6 +1652,361 @@ def nutrition_section(nu, food, burn, report):
             'burn and logged calories are both estimates; the weekly scale trend is the check on both.</p></div></div></section>')
 
 
+# ---------------------------------------------------------------- diet vs training
+
+# Daily carbohydrate guide by training time (IOC/ACSM sports-nutrition consensus, Thomas et al. 2016,
+# doi:10.1016/j.jand.2015.12.006): light 3-5 g/kg, ~1 h/day 5-7, 1-3 h/day 6-10.
+CARB_BANDS = [(45, (3, 5), "light day"), (90, (5, 7), "about an hour of training"), (10**9, (6, 10), "90+ min of training")]
+PROTEIN_GKG = (1.6, 2.2)        # Morton 2018 meta-analysis plateau 1.6; upper end for a deficit while lifting
+MEAL_PROTEIN_GKG = 0.4          # per-meal dose that maximizes muscle protein synthesis (Schoenfeld & Aragon 2018)
+EA_LOW, EA_OK = 30, 45          # energy availability, kcal per kg fat-free mass (Mountjoy 2023 RED-S consensus)
+DIET_SOURCES = [
+    ("ACSM/AND/DC nutrition and athletic performance (Thomas 2016)", "https://doi.org/10.1016/j.jand.2015.12.006"),
+    ("Protein and resistance training meta-analysis (Morton 2018)", "https://doi.org/10.1136/bjsports-2017-097608"),
+    ("Protein per meal (Schoenfeld & Aragon 2018)", "https://doi.org/10.1186/s12970-018-0215-1"),
+    ("IOC consensus on RED-S (Mountjoy 2023)", "https://doi.org/10.1136/bjsports-2023-106994"),
+    ("NIH Office of Dietary Supplements fact sheets", "https://ods.od.nih.gov/factsheets/list-all/"),
+]
+
+# Key nutrients for a 48-year-old male endurance runner. Targets: US Dietary Reference Intakes, men 31-50.
+# (label, HealthKit type, unit, target, kind, why it matters for you, food sources)
+KEY_NUTRIENTS = [
+    ("Fiber", "dietaryFiber", "g", 38, "min", "Gut health and fullness during a deficit.",
+     "beans, lentils, oats, berries, vegetables"),
+    ("Iron", "dietaryIron", "mg", 8, "min", "Carries oxygen; runners lose extra through sweat, gut and foot-strike.",
+     "red meat, lentils, spinach, fortified cereal (with vitamin C)"),
+    ("Vitamin D", "dietaryVitaminD", "mcg", 15, "min", "Bone and muscle; at your latitude the skin makes almost none from October to March.",
+     "salmon, sardines, eggs, fortified milk; a blood test tells you if you need a supplement"),
+    ("Calcium", "dietaryCalcium", "mg", 1000, "min", "Bone strength under running impact, more so in a calorie deficit.",
+     "dairy, fortified soy milk, canned salmon with bones, tofu"),
+    ("Magnesium", "dietaryMagnesium", "mg", 420, "min", "Muscle and nerve function; lost in sweat.",
+     "pumpkin seeds, almonds, spinach, black beans, whole grains"),
+    ("Potassium", "dietaryPotassium", "mg", 3400, "min", "Fluid balance and muscle contraction; lost in sweat.",
+     "potatoes, bananas, beans, yogurt, leafy greens"),
+    ("Sodium", "dietarySodium", "mg", 1500, "min", "Replaces sweat losses on long runs; 1,500 mg is the floor, 2,300 mg the usual ceiling for non-athletes.",
+     "salted foods, electrolyte drinks around long runs"),
+    ("Vitamin B12", "dietaryVitaminB12", "mcg", 2.4, "min", "Red-cell production; absorption falls with age.",
+     "meat, fish, eggs, dairy, fortified foods"),
+    ("Folate", "dietaryFolate", "mcg", 400, "min", "Red-cell production alongside B12.",
+     "leafy greens, beans, asparagus, fortified grains"),
+    ("Zinc", "dietaryZinc", "mg", 11, "min", "Immune function and recovery.",
+     "beef, shellfish, pumpkin seeds, chickpeas"),
+    ("Vitamin C", "dietaryVitaminC", "mg", 90, "min", "Immune support under heavy training; helps absorb plant iron.",
+     "citrus, peppers, strawberries, broccoli"),
+    ("Saturated fat", "dietaryFatSaturated", "pct", 10, "max", "Heart health; keep under 10% of calories.",
+     "swap some butter and fatty meat for olive oil, nuts and fish"),
+]
+_UNIT = {"g": 1.0, "mg": 1e-3, "mcg": 1e-6, "µg": 1e-6, "ug": 1e-6}
+
+
+def _hk_key(hk_type):
+    return HK_TYPES.get(hk_type.lower()) or None
+
+
+def load_meals(directory=NUTRITION_DIR):
+    """Per-entry rows from long-format exports, grouped into meals (entries within 30 min of each other)."""
+    import re
+    out = {}
+    if not directory.exists():
+        return out
+    for f in sorted((f for f in directory.iterdir() if f.suffix.lower() == ".csv"), key=lambda f: f.stat().st_mtime):
+        try:
+            rows = list(csv.DictReader(io.StringIO(f.read_text())))
+        except (OSError, ValueError):
+            continue
+        ent = {}
+        for r in rows:
+            r = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
+            when, key = r.get("source/time", ""), HK_TYPES.get(r.get("type", "").lower())
+            m = re.search(r"(\d{2}):(\d{2})", when)
+            if "total" in when.lower() or key not in ("kcal", "protein", "carbs", "fat") or not m:
+                continue
+            try:
+                q = float(r.get("value"))
+            except (TypeError, ValueError):
+                continue
+            mins = int(m.group(1)) * 60 + int(m.group(2))
+            e = ent.setdefault(_day(r.get("date")), {}).setdefault(mins, {"t": mins})
+            e[key] = e.get(key, 0) + q
+        for d, by_t in ent.items():
+            meals = []
+            for t in sorted(by_t):
+                if meals and t - meals[-1]["end"] <= 30:
+                    for k, v in by_t[t].items():
+                        if k != "t":
+                            meals[-1][k] = meals[-1].get(k, 0) + v
+                    meals[-1]["end"] = t
+                else:
+                    meals.append({**by_t[t], "end": t})
+            out[d] = meals
+    return out
+
+
+def bmr_by_day(report, days_back=35):
+    start = (report - dt.timedelta(days=days_back)).isoformat()
+    try:
+        rows = sql(f"""SELECT r.id d, json_extract(data,'$.bmrKilocalories') b FROM resources r
+          WHERE resource_type='daily_summary' AND r.id BETWEEN '{start}' AND '{report.isoformat()}'""")
+    except RuntimeError:
+        return {}
+    return {r["d"]: r["b"] for r in rows if isinstance(r.get("b"), (int, float)) and r["b"] > 800}
+
+
+def _sessions(day):
+    """Activities with start/end minutes, overlapping duplicates (e.g. a class logged twice) merged."""
+    out = []
+    for a in day.get("activities", []):
+        try:
+            st_ = dt.datetime.fromisoformat(str(a["start"]).replace(" ", "T"))
+        except (KeyError, ValueError):
+            continue
+        s = st_.hour * 60 + st_.minute
+        out.append(dict(s=s, e=s + (a.get("dur_min") or 0), type=a.get("type") or "", name=a.get("name") or "",
+                        kcal=a.get("kcal") or 0, dur=a.get("dur_min") or 0, load=a.get("load") or 0))
+    out.sort(key=lambda x: x["s"])
+    union = 0.0
+    cur = None
+    for x in out:
+        if cur and x["s"] < cur[1]:
+            cur[1] = max(cur[1], x["e"])
+        else:
+            if cur:
+                union += cur[1] - cur[0]
+            cur = [x["s"], x["e"]]
+    if cur:
+        union += cur[1] - cur[0]
+    return out, union
+
+
+def diet_vs_training(food, meals, days, report, weight_lb, lean_lb, bmr, wo=None):
+    """How each logged day's food matched that day's training, plus today's fuel plan."""
+    if not food or not weight_lb:
+        return None
+    kg = weight_lb / 2.20462
+    ffm = lean_lb / 2.20462 if lean_lb else kg * 0.8
+    meal_g = MEAL_PROTEIN_GKG * kg
+    end = report - dt.timedelta(days=1)
+    rows = []
+    for i in range(6, -1, -1):
+        d = (end - dt.timedelta(days=i)).isoformat()
+        f = food.get(d)
+        if not f:
+            continue
+        sess, train_min = _sessions(days.get(d, {}))
+        per_min = (bmr.get(d) or 1700) / 1440
+        ex_kcal = sum(max(0.0, s["kcal"] - s["dur"] * per_min) for s in sess)  # net of resting burn
+        run_min = sum(s["dur"] for s in sess if "run" in s["type"])
+        # Running drives carbohydrate use; strength and walking count half.
+        fuel_min = run_min + 0.5 * max(0.0, train_min - run_min)
+        lo, hi = next(b for lim, b, _ in CARB_BANDS if fuel_min < lim)
+        band_txt = next(t for lim, _, t in CARB_BANDS if fuel_min < lim)
+        dm = meals.get(d, [])
+        big = [m for m in dm if (m.get("protein") or 0) >= meal_g]
+        # Recovery: protein >= 20 g within 2 h after a run of 45+ min or a strength session of 20+ min.
+        keys = [s for s in sess if ("run" in s["type"] and s["dur"] >= 45) or ("strength" in s["type"] and s["dur"] >= 20)]
+        rec = None
+        if keys and dm:
+            rec = any(k["e"] - 15 <= m["t"] <= k["e"] + 120 and (m.get("protein") or 0) >= 20 for k in keys for m in dm)
+        long_run = next((s for s in sess if "run" in s["type"] and s["dur"] >= 75), None)
+        pre = None
+        if long_run and dm:
+            pre = any(long_run["s"] - 180 <= m["t"] <= long_run["s"] and (m.get("carbs") or 0) >= 30 for m in dm)
+        rows.append(dict(
+            d=d, train_min=train_min, run_min=run_min, sessions=[s["name"] for s in sess],
+            kcal=f.get("kcal"), ex_kcal=ex_kcal, ea=((f.get("kcal") or 0) - ex_kcal) / ffm,
+            carbs_gkg=(f.get("carbs") or 0) / kg if f.get("carbs") is not None else None, carb_band=(lo, hi), band_txt=band_txt,
+            protein_gkg=(f.get("protein") or 0) / kg if f.get("protein") is not None else None,
+            fat_pct=(f["fat"] * 9 / f["kcal"] * 100) if f.get("fat") and f.get("kcal") else None,
+            meals=len(dm), protein_meals=len(big), recovery=rec, pre_long=pre,
+            water=f.get("water"), water_need=3.0 + 0.6 * train_min / 60))
+    if not rows:
+        return None
+
+    def avg(k):
+        v = [r[k] for r in rows if r.get(k) is not None]
+        return st.mean(v) if v else None
+    ea = avg("ea")
+    carb_short = [r for r in rows if r["carbs_gkg"] is not None and r["carbs_gkg"] < r["carb_band"][0]]
+    hard_short = [r for r in carb_short if r["train_min"] >= 45]
+    pgkg = avg("protein_gkg")
+    rec_days = [r for r in rows if r["recovery"] is not None]
+    pm = avg("protein_meals")
+    findings = []  # (tone, title, text)
+    if ea is not None:
+        if ea < EA_LOW:
+            findings.append(("bad", "Energy availability is low",
+                             f"If your logs are complete, after subtracting exercise you averaged {ea:.0f} kcal per kg of lean mass a day. Under {EA_LOW} is the range "
+                             "linked to lost muscle, slower recovery, lower testosterone and bone loss (RED-S). "
+                             "Eat more on training days, not on rest days, so the deficit comes off rest days."))
+        elif ea < EA_OK:
+            findings.append(("ok", "Energy availability suits gradual fat loss",
+                             f"{ea:.0f} kcal per kg of lean mass a day after exercise: between {EA_LOW} and {EA_OK}, the range for steady fat loss."))
+        else:
+            findings.append(("good", "Energy availability is healthy", f"{ea:.0f} kcal per kg of lean mass a day after exercise."))
+    if carb_short:
+        worst = min(carb_short, key=lambda r: r["carbs_gkg"] - r["carb_band"][0])
+        wd = dt.date.fromisoformat(worst["d"]).strftime("%a")
+        findings.append(("bad" if hard_short else "ok", "Carbohydrate is under what your training uses",
+                         f"{len(carb_short)} of {len(rows)} logged days were under the guide for that day's training. "
+                         f"{wd}: {worst['carbs_gkg']:.1f} g/kg with {worst['run_min']:.0f} min of running and {worst['train_min'] - worst['run_min']:.0f} min of other training, against "
+                         f"{worst['carb_band'][0]}–{worst['carb_band'][1]} g/kg for {worst['band_txt']}. "
+                         "Low carbs on hard days blunts interval quality and raises perceived effort; cut carbs on rest days instead."))
+    elif any(r["carbs_gkg"] is not None for r in rows):
+        findings.append(("good", "Carbohydrate matches your training", "Every logged day was inside the guide for that day's training."))
+    if pgkg is not None:
+        if pgkg < PROTEIN_GKG[0]:
+            findings.append(("bad", "Protein is too low to protect muscle in a deficit",
+                             f"{pgkg:.1f} g/kg a day against {PROTEIN_GKG[0]}–{PROTEIN_GKG[1]} g/kg "
+                             f"({PROTEIN_GKG[0]*kg:.0f}–{PROTEIN_GKG[1]*kg:.0f} g at {weight_lb:.0f} lb). "
+                             "This matches the lean-mass loss on your scale."))
+        else:
+            findings.append(("good", "Protein total is in range", f"{pgkg:.1f} g/kg a day."))
+    if pm is not None and any(r["meals"] for r in rows):
+        findings.append(("good" if pm >= 3 else "bad", "Protein spread across meals",
+                         f"On average {pm:.1f} meals a day reached {meal_g:.0f} g of protein ({MEAL_PROTEIN_GKG} g/kg); aim for 3–4. "
+                         "Spreading it out builds more muscle than the same total in one or two meals."))
+    if rec_days:
+        hit = sum(1 for r in rec_days if r["recovery"])
+        findings.append(("good" if hit == len(rec_days) else "bad", "Recovery meal after key sessions",
+                         f"{hit} of {len(rec_days)} days with a key run or strength session had 20 g+ protein within 2 h afterwards."))
+    pre_days = [r for r in rows if r["pre_long"] is not None]
+    if pre_days:
+        hit = sum(1 for r in pre_days if r["pre_long"])
+        findings.append(("good" if hit == len(pre_days) else "bad", "Fuel before long runs",
+                         f"{hit} of {len(pre_days)} long run{'s' if len(pre_days) != 1 else ''} had 30 g+ of carbohydrate in the 3 h before."))
+    fat = avg("fat_pct")
+    if fat is not None and fat < 20:
+        findings.append(("bad", "Fat is below 20% of calories", f"{fat:.0f}%; under 20% can lower testosterone and vitamin absorption."))
+    wat = [r for r in rows if r["water"] is not None]
+    if wat:
+        short = [r for r in wat if r["water"] < r["water_need"] * 0.8]
+        findings.append(("bad" if short else "good", "Fluids",
+                         f"{st.mean(r['water'] for r in wat):.1f} L a day logged against about "
+                         f"{st.mean(r['water_need'] for r in wat):.1f} L for your training (3 L plus about 0.6 L per training hour)"
+                         + (f"; {len(short)} day{'s' if len(short) != 1 else ''} well short." if short else ".")))
+
+    # Today's fuel plan from today's workout level.
+    lvl = (wo or {}).get("level")
+    plan_band = {"Quality": (5, 7), "Moderate": (5, 7), "Easy": (3, 5), "Rest": (3, 4), "Done": (5, 7)}.get(lvl, (4, 6))
+    today = dict(level=lvl, carbs=(round(plan_band[0] * kg, -1), round(plan_band[1] * kg, -1)),
+                 protein=(round(PROTEIN_GKG[0] * kg, -1), round(PROTEIN_GKG[1] * kg, -1)), meal_protein=round(meal_g / 5) * 5,
+                 before=("30–60 g carbohydrate 1–3 h before (a bagel with honey, oatmeal with a banana)"
+                         if lvl in ("Quality", "Moderate") else None),
+                 after=(f"{round(meal_g / 5) * 5:.0f} g protein plus about {round(kg, -1):.0f} g carbohydrate within 2 h "
+                        "(Greek yogurt with granola and fruit, or a turkey sandwich and chocolate milk)"
+                        if lvl in ("Quality", "Moderate", "Done") else None))
+    return dict(rows=rows, findings=findings, today=today, kg=kg, ffm=ffm, ea=ea, protein_gkg=pgkg)
+
+
+def nutrient_gaps(food, report, kcal_avg=None):
+    """Key nutrients for this athlete: average of the last 7 logged days vs target, or 'not tracked'."""
+    end = report - dt.timedelta(days=1)
+    ds = [(end - dt.timedelta(days=i)).isoformat() for i in range(7)]
+    logged = [food[d] for d in ds if d in food]
+    out = []
+    for label, hk, unit, target, kind, why, foods in KEY_NUTRIENTS:
+        vals = []
+        for f in logged:
+            hit = next(((k, v) for k, v in f.items() if k.startswith("x:") and k[2:].split("|")[0].lower() == _hk_label(hk).lower()), None)
+            if not hit and hk == "dietaryFiber" and f.get("fiber") is not None:
+                hit = ("x:Fiber|g", f["fiber"])
+            if hit:
+                u = hit[0].split("|", 1)[1].lower() if "|" in hit[0] else "g"
+                v = hit[1]
+                if unit == "pct":
+                    v = v * 9 / f["kcal"] * 100 if f.get("kcal") else None
+                elif u in _UNIT:
+                    v = v * _UNIT[u] / _UNIT[unit]
+                if v is not None:
+                    vals.append(v)
+        if not vals:
+            status = "not tracked"
+            val = None
+        else:
+            val = st.mean(vals)
+            ok = val >= target if kind == "min" else val <= target
+            status = "ok" if ok else ("short" if kind == "min" else "high")
+        out.append(dict(nutrient=label, value=val, unit="% kcal" if unit == "pct" else unit, target=target, kind=kind,
+                        status=status, why=why, foods=foods))
+    tracked = [g for g in out if g["status"] != "not tracked"]
+    notes = []
+    if kcal_avg and kcal_avg < 2000:
+        notes.append(f"At about {kcal_avg:,.0f} kcal a day it is hard to reach the targets for iron, magnesium, calcium, potassium "
+                     "and fiber from food alone; choose nutrient-dense foods for most of those calories.")
+    if 10 <= report.month or report.month <= 3:
+        notes.append("Vitamin D: at a Seattle-area latitude, sunlight makes almost none between October and March. "
+                     "Diet rarely covers 15 mcg (600 IU); ask your doctor for a 25(OH)D blood test.")
+    return dict(rows=out, tracked=len(tracked), notes=notes)
+
+
+def _fmt_amount(v, unit):
+    if v is None:
+        return "—"
+    return f"{v:,.0f} {unit}" if v >= 10 else f"{v:.1f} {unit}"
+
+
+def diet_fit_section(df, gaps):
+    if not df and not gaps:
+        return ""
+    parts = ['<section><h2>How your diet fits your training</h2>']
+    if df:
+        tone_cls = {"good": "better", "ok": "steady", "bad": "watch"}
+        tone_sym = {"good": "▲", "ok": "●", "bad": "▽"}
+        items = "".join(f'<li><span class="pill {tone_cls[t]}">{tone_sym[t]}</span> <b>{esc(h)}.</b> {esc(b)}</li>'
+                        for t, h, b in df["findings"])
+        td = df["today"]
+        plan = [f'<b>Carbohydrate:</b> {td["carbs"][0]:.0f}–{td["carbs"][1]:.0f} g', f'<b>Protein:</b> {td["protein"][0]:.0f}–{td["protein"][1]:.0f} g, '
+                f'in 3–4 meals of about {td["meal_protein"]:.0f} g']
+        if td["before"]:
+            plan.append(f'<b>Before the run:</b> {esc(td["before"])}')
+        if td["after"]:
+            plan.append(f'<b>After:</b> {esc(td["after"])}')
+        rows = []
+        for r in df["rows"]:
+            dd = dt.date.fromisoformat(r["d"]).strftime("%a %-m/%-d")
+            cg = r["carbs_gkg"]
+            c_ok = cg is not None and cg >= r["carb_band"][0]
+            pg = r["protein_gkg"]
+            p_ok = pg is not None and pg >= PROTEIN_GKG[0]
+            ea_cls = "good" if r["ea"] >= EA_OK else "warn" if r["ea"] >= EA_LOW else "bad"
+            rows.append(f'<tr><td>{dd}</td><td class="num">{r["train_min"]:.0f} min</td><td class="num">{r["kcal"]:,.0f}</td>'
+                        f'<td class="num" style="color:var(--{ea_cls}-ink)">{r["ea"]:.0f}</td>'
+                        f'<td class="num" style="color:var(--{"good" if c_ok else "bad"}-ink)">{cg:.1f}</td>'
+                        f'<td class="num">{r["carb_band"][0]}–{r["carb_band"][1]}</td>'
+                        f'<td class="num" style="color:var(--{"good" if p_ok else "bad"}-ink)">{pg:.1f}</td>'
+                        f'<td class="num">{r["protein_meals"]}/{r["meals"]}</td></tr>' if cg is not None and pg is not None else "")
+        parts.append('<div class="grid2"><div class="panel" style="display:flex;flex-direction:column;gap:8px"><h3>What the logs show</h3>'
+                     f'<ul style="margin:0;padding-left:0;list-style:none;display:flex;flex-direction:column;gap:8px">{items}</ul></div>'
+                     f'<div class="panel" style="display:flex;flex-direction:column;gap:8px"><h3>Fuel for today ({esc(td["level"] or "—")} day)</h3>'
+                     + "".join(f'<p style="margin:0">{l}</p>' for l in plan)
+                     + f'<p class="muted" style="margin:0;font-size:12px">Based on {df["kg"]:.0f} kg body weight and '
+                       f'{df["ffm"]:.0f} kg lean mass from your scale.</p></div></div>')
+        parts.append('<div class="panel tbl" style="margin-top:12px"><table style="min-width:560px"><thead><tr><th>Day</th><th>Training</th>'
+                     '<th>Eaten kcal</th><th>Energy avail.</th><th>Carbs g/kg</th><th>Guide</th><th>Protein g/kg</th>'
+                     f'<th>Meals 0.4 g/kg+</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
+                     f'<p class="muted" style="margin:8px 0 0;font-size:12px">Energy availability = calories eaten minus exercise calories '
+                     f'(net of resting burn), per kg of lean mass: under {EA_LOW} is low, {EA_LOW}–{EA_OK} suits fat loss, {EA_OK}+ is maintenance. '
+                     f'Protein guide {PROTEIN_GKG[0]}–{PROTEIN_GKG[1]} g/kg.</p></div>')
+    if gaps:
+        st_cls = {"ok": ("better", "On target"), "short": ("watch", "Short"), "high": ("watch", "Over"), "not tracked": ("steady", "Not tracked")}
+        rows = "".join(
+            f'<tr><td><b>{esc(g["nutrient"])}</b></td><td class="num">{_fmt_amount(g["value"], g["unit"])}</td>'
+            f'<td class="num">{"under " if g["kind"] == "max" else ""}{g["target"]:,} {esc(g["unit"])}</td>'
+            f'<td><span class="pill {st_cls[g["status"]][0]}" style="white-space:nowrap">{st_cls[g["status"]][1]}</span></td>'
+            f'<td>{esc(g["why"])} <span class="muted">Sources: {esc(g["foods"])}.</span></td></tr>' for g in gaps["rows"])
+        untracked = [g["nutrient"] for g in gaps["rows"] if g["status"] == "not tracked"]
+        note = "".join(f'<p style="margin:8px 0 0">{esc(n)}</p>' for n in gaps["notes"])
+        if untracked:
+            note += (f'<p class="muted" style="margin:8px 0 0;font-size:12px">Not in your export yet: {esc(", ".join(untracked))}. '
+                     'MyNetDiary records most of these; add them to the Apple Health export and this table fills in automatically.</p>')
+        parts.append('<h3 style="margin:18px 0 8px">Key nutrients for a 48-year-old runner</h3>'
+                     '<div class="panel tbl"><table class="peer" style="min-width:620px"><thead><tr><th>Nutrient</th><th>You (7-day avg)</th>'
+                     f'<th>Target</th><th>Status</th><th>Why it matters</th></tr></thead><tbody>{rows}</tbody></table>{note}</div>')
+    src = " · ".join(f'<a href="{esc(u)}" target="_blank" rel="noopener">{esc(n)}</a>' for n, u in DIET_SOURCES)
+    parts.append(f'<p class="muted" style="font-size:12px">Sources: {src}. Targets are US Dietary Reference Intakes for men 31–50.</p></section>')
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------- peer comparison
 
 # FRIEND registry treadmill VO2 max percentiles, men (Kaminsky et al., Mayo Clin Proc 2015,
@@ -1897,6 +2253,7 @@ def render(report, days, ms, recs, plan, generated, wo=None, x=None):
 {training_html}
 {body_comp_section(x.get("body_comp"), x.get("weighins") or []) if "body_comp" in x else ""}
 {nutrition_section(x.get("nutrition"), x.get("food") or {}, x.get("burn") or {}, report) if "nutrition" in x else ""}
+{diet_fit_section(x.get("diet_fit"), x.get("gaps"))}
 {peer_section(x.get("peers"))}
 <section><h2>How the last 24 hours compare</h2>
 <div class="panel"><div class="legend"><span><i style="background:var(--bad)"></i>Worse than 30-day avg</span>
@@ -2046,6 +2403,31 @@ def render_email(report, ms, recs, plan, wo, x, state, tone, summary, bullets):
             m = nu["macro"]
             lines.append(f'<b>Macros:</b> {m["protein"]:.0f}% protein · {m["carbs"]:.0f}% carbs · {m["fat"]:.0f}% fat')
         out.append(card("Nutrition · last 7 days", "".join(p(l) for l in lines) + "".join(p("• " + esc(t), f"color:{muted}") for t in nu["tips"])))
+    df, gaps = x.get("diet_fit"), x.get("gaps")
+    if df:
+        col = {"good": "#0a7a0a", "ok": "#6b7280", "bad": "#b42f2f"}
+        sym = {"good": "✓", "ok": "●", "bad": "✗"}
+        body = "".join(p(f'<b style="color:{col[t]}">{sym[t]} {esc(h)}.</b> {esc(b)}') for t, h, b in df["findings"])
+        tdy = df["today"]
+        fuel = (f'<b>Fuel for today ({esc(tdy["level"] or "")} day):</b> carbohydrate {tdy["carbs"][0]:.0f}–{tdy["carbs"][1]:.0f} g, '
+                f'protein {tdy["protein"][0]:.0f}–{tdy["protein"][1]:.0f} g in 3–4 meals of about {tdy["meal_protein"]:.0f} g.')
+        if tdy["before"]:
+            fuel += f' Before the run: {esc(tdy["before"])}.'
+        if tdy["after"]:
+            fuel += f' After: {esc(tdy["after"])}.'
+        body += p(fuel)
+        if gaps:
+            short = [g for g in gaps["rows"] if g["status"] in ("short", "high")]
+            untracked = [g["nutrient"] for g in gaps["rows"] if g["status"] == "not tracked"]
+            for g in short:
+                body += p(f'<b style="color:#b42f2f">{esc(g["nutrient"])}:</b> {_fmt_amount(g["value"], g["unit"])} vs '
+                          f'{"under " if g["kind"] == "max" else ""}{g["target"]:,} {esc(g["unit"])}. {esc(g["why"])} Sources: {esc(g["foods"])}.')
+            for n in gaps["notes"]:
+                body += p(esc(n), f"color:{muted}")
+            if untracked:
+                body += p(f'Not in your export yet: {esc(", ".join(untracked))}. Add them to the Apple Health export to check for gaps.',
+                          f"color:{muted}")
+        out.append(card("How your diet fits your training", body))
     peers = x.get("peers")
     if peers:
         rows = "".join(f'<tr><td style="{td}"><b>{esc(r["metric"])}</b></td><td style="{td}">{esc(r["you"])}</td>'
@@ -2116,6 +2498,9 @@ def main() -> int:
     extras["burn"] = calorie_burn(report)
     latest_lb = extras["weighins"][-1]["lb"] if extras["weighins"] else None
     extras["nutrition"] = nutrition_summary(extras["food"], extras["burn"], report, extras["body_comp"], latest_lb)
+    lean_lb = (extras["body_comp"] or {}).get("latest", {}).get("lean")
+    extras["diet_fit"] = diet_vs_training(extras["food"], load_meals(), days, report, latest_lb, lean_lb, bmr_by_day(report), wo)
+    extras["gaps"] = nutrient_gaps(extras["food"], report, (extras["nutrition"] or {}).get("kcal7")) if extras["food"] else None
     page = render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo, extras)
     out.write_text(page)
     # Standalone copy with its own document skeleton, for publishers that don't add one.
@@ -2138,6 +2523,12 @@ def main() -> int:
                   reminders=extras["reminders"], peers=extras["peers"],
                   body_comp={k: v for k, v in (extras["body_comp"] or {}).items() if k != "weeks"} or None,
                   nutrition=extras["nutrition"],
+                  diet_fit=({"findings": [dict(tone=t, title=h, text=b) for t, h, b in extras["diet_fit"]["findings"]],
+                             "today": extras["diet_fit"]["today"], "energy_availability": extras["diet_fit"]["ea"],
+                             "protein_g_per_kg": extras["diet_fit"]["protein_gkg"]} if extras["diet_fit"] else None),
+                  nutrient_gaps=({"short": [g["nutrient"] for g in extras["gaps"]["rows"] if g["status"] in ("short", "high")],
+                                  "not_tracked": [g["nutrient"] for g in extras["gaps"]["rows"] if g["status"] == "not tracked"],
+                                  "notes": extras["gaps"]["notes"]} if extras["gaps"] else None),
                   vo2max=extras["vo2"][-1][1] if extras["vo2"] else None,
                   garmin_signin_expires=extras["auth_expiry"].isoformat() if extras["auth_expiry"] else None,
                   metrics=[{k: m.get(k) for k in ("label", "cur", "a7", "a30", "status", "unit")} for m in ms])

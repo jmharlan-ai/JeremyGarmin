@@ -23,7 +23,12 @@ rate, steps, sleep and BMI compare with men your age (sourced norms), plus a 13-
 scale (read from Garmin's weight service with the CLI's stored sign-in), and a
 nutrition section from Apple Health (MyNetDiary) exports that Health Auto Export
 saves to Google Drive; the morning task copies the newest export into
-`reports/nutrition/` before running the script. `--json` includes a one-line `headline`
+`reports/nutrition/` before running the script. A "How your diet fits your training" section
+matches each logged day's food to that day's Garmin training (energy availability per kg of lean
+mass, carbohydrate g/kg against the sports-nutrition guide for the day's running, protein g/kg and
+per-meal doses, recovery and pre-long-run fueling, fluids), gives a fuel plan for today's workout,
+and checks key nutrients (fiber, iron, vitamin D, calcium, magnesium, potassium, sodium, B12,
+folate, zinc, vitamin C, saturated fat) against the DRIs, listing any the export doesn't include. `--json` includes a one-line `headline`
 for phone notifications.
 
 Requires a signed-in `garmin-pp-cli` (`garmin-pp-cli auth login --email ...`).
