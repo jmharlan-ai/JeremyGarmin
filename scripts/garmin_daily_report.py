@@ -229,7 +229,8 @@ def fill_live(days, report):
         for key, path, scale in (("steps", "totalSteps", 1), ("step_goal", "dailyStepGoal", 1),
                                  ("stress", "averageStressLevel", 1), ("high_stress_min", "highStressDuration", 1 / 60),
                                  ("bb_low", "bodyBatteryLowestValue", 1), ("rhr", "restingHeartRate", 1),
-                                 ("spo2", "averageSpo2", 1), ("resp", "avgWakingRespirationValue", 1)):
+                                 ("spo2", "averageSpo2", 1), ("resp", "avgWakingRespirationValue", 1),
+                                 ("total_kcal", "totalKilocalories", 1), ("bmr_kcal", "bmrKilocalories", 1)):
             v = summary.get(path)
             if isinstance(v, (int, float)) and v >= 0:
                 yrec[key] = v * scale
@@ -1451,6 +1452,11 @@ def load_nutrition(directory=NUTRITION_DIR):
                     for r in rows:
                         r = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
                         d, t = _day(r.get("date")), r.get("type", "")
+                        # Newer exports mark totals in the type ("dietaryProtein (daily total)") with source "daily sum".
+                        is_total = "total" in r.get("source/time", "").lower() or "daily sum" in r.get("source/time", "").lower()
+                        if "(" in t:
+                            is_total = is_total or "total" in t.lower()
+                            t = t.split("(", 1)[0].strip()
                         try:
                             q = float(r.get("value"))
                         except (TypeError, ValueError):
@@ -1461,7 +1467,7 @@ def load_nutrition(directory=NUTRITION_DIR):
                             continue
                         if key == "kcal" and unit.lower() == "kj":
                             q /= 4.184
-                        bucket = totals if "total" in r.get("source/time", "").lower() else entries
+                        bucket = totals if is_total else entries
                         bucket.setdefault(d, {}).setdefault(key, 0.0)
                         bucket[d][key] += q
                     for d in set(totals) | set(entries):
@@ -1802,8 +1808,9 @@ def diet_vs_training(food, meals, days, report, weight_lb, lean_lb, bmr, wo=None
         band_txt = next(t for lim, _, t in CARB_BANDS if fuel_min < lim)
         dm = meals.get(d, [])
         big = [m for m in dm if (m.get("protein") or 0) >= meal_g]
-        # Recovery: protein >= 20 g within 2 h after a run of 45+ min or a strength session of 20+ min.
-        keys = [s for s in sess if ("run" in s["type"] and s["dur"] >= 45) or ("strength" in s["type"] and s["dur"] >= 20)]
+        # Recovery: protein >= 20 g within 2 h after a key run (45+ min or load 100+) or a strength session of 20+ min.
+        keys = [s for s in sess if ("run" in s["type"] and (s["dur"] >= 45 or s["load"] >= 100))
+                or ("strength" in s["type"] and s["dur"] >= 20)]
         rec = None
         if keys and dm:
             rec = any(k["e"] - 15 <= m["t"] <= k["e"] + 120 and (m.get("protein") or 0) >= 20 for k in keys for m in dm)
@@ -2496,10 +2503,17 @@ def main() -> int:
     extras["body_comp"] = body_comp(extras["weighins"], report)
     extras["food"] = load_nutrition()
     extras["burn"] = calorie_burn(report)
+    bmr = bmr_by_day(report)
+    # The archive can hold an early-morning snapshot of yesterday; use the live totals fill_live fetched.
+    yrec = days.get((report - dt.timedelta(days=1)).isoformat(), {})
+    if (yrec.get("total_kcal") or 0) > 1000:
+        extras["burn"][(report - dt.timedelta(days=1)).isoformat()] = yrec["total_kcal"]
+    if (yrec.get("bmr_kcal") or 0) > 800:
+        bmr[(report - dt.timedelta(days=1)).isoformat()] = yrec["bmr_kcal"]
     latest_lb = extras["weighins"][-1]["lb"] if extras["weighins"] else None
     extras["nutrition"] = nutrition_summary(extras["food"], extras["burn"], report, extras["body_comp"], latest_lb)
     lean_lb = (extras["body_comp"] or {}).get("latest", {}).get("lean")
-    extras["diet_fit"] = diet_vs_training(extras["food"], load_meals(), days, report, latest_lb, lean_lb, bmr_by_day(report), wo)
+    extras["diet_fit"] = diet_vs_training(extras["food"], load_meals(), days, report, latest_lb, lean_lb, bmr, wo)
     extras["gaps"] = nutrient_gaps(extras["food"], report, (extras["nutrition"] or {}).get("kcal7")) if extras["food"] else None
     page = render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo, extras)
     out.write_text(page)
