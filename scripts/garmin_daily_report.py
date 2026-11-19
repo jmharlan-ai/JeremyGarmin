@@ -1644,7 +1644,9 @@ def nutrition_section(nu, food, burn, report):
     for label, v in (nu.get("extras") or {}).items():
         name, unit = label.split("|", 1)
         if v is not None:
-            kv.append(f'<dt>{esc(name)}</dt><dd>{v:,.0f} {esc(unit)}/day</dd>')
+            if unit.lower() == "g" and v < 1:
+                v, unit = v * 1000, "mg"
+            kv.append(f'<dt>{esc(name)}</dt><dd>{_fmt_amount(v, esc(unit))}/day</dd>')
     tips = "".join(f'<li>{esc(t)}</li>' for t in nu["tips"])
     return ('<section><h2>Nutrition · from MyNetDiary via Apple Health</h2><div class="grid2">'
             '<div class="panel" style="display:flex;flex-direction:column;gap:8px"><h3>Calories eaten vs burned · last 14 days</h3>'
