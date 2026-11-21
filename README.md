@@ -28,7 +28,10 @@ matches each logged day's food to that day's Garmin training (energy availabilit
 mass, carbohydrate g/kg against the sports-nutrition guide for the day's running, protein g/kg and
 per-meal doses, recovery and pre-long-run fueling, fluids), gives a fuel plan for today's workout,
 and checks key nutrients (fiber, iron, vitamin D, calcium, magnesium, potassium, sodium, B12,
-folate, zinc, vitamin C, saturated fat) against the DRIs, listing any the export doesn't include. `--json` includes a one-line `headline`
+folate, zinc, vitamin C, saturated fat) against the DRIs, listing any the export doesn't include. Lab results from Apple Health Health Records (FHIR JSON from the
+export's `clinical-records` folder, a zip of it, or a date,test,value,unit,low,high CSV in
+`reports/labs/`) are charted per test across every year available, checked against the lab's
+reference range, and linked to training or diet changes that can move them. `--json` includes a one-line `headline`
 for phone notifications.
 
 Requires a signed-in `garmin-pp-cli` (`garmin-pp-cli auth login --email ...`).

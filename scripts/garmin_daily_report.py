@@ -779,7 +779,7 @@ footer{font-size:12px;color:var(--muted)}
 .badge{display:inline-flex;gap:6px;align-items:center;font-weight:700;font-size:13px;padding:2px 10px;border-radius:999px;border:1.5px solid currentColor}
 .badge.pass{color:var(--good-ink)}.badge.under{color:var(--bad-ink)}
 .notice{background:var(--panel);border:1px solid var(--warn);border-left:6px solid var(--warn);border-radius:12px;padding:12px 16px}
-table.peer td{text-align:left;vertical-align:top}table.peer th{text-align:left}
+.spark{width:220px;height:56px;display:block}table.peer td{text-align:left;vertical-align:top}table.peer th{text-align:left}
 table.peer td:nth-child(4){color:var(--ink2)}
 .panel a{color:var(--accent)}
 .remind{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;font-size:14px}
@@ -2016,6 +2016,294 @@ def diet_fit_section(df, gaps):
     return "".join(parts)
 
 
+# ---------------------------------------------------------------- lab results (Apple Health Health Records)
+
+LABS_DIR = Path(os.environ.get("LABS_DIR", str(Path(__file__).resolve().parent.parent / "reports" / "labs")))
+
+# key: (label, LOINC codes, name keywords, unit, default (low, high), better: 'low'|'high'|'range', action)
+# Default ranges are typical US adult-male reference intervals; the lab's own range wins when the record has one.
+LAB_TESTS = {
+    "ldl": ("LDL cholesterol", {"13457-7", "18262-6", "2089-1"}, ("ldl",), "mg/dL", (None, 100), "low",
+            "Diet moves LDL most: 8-10 g a day of soluble fiber (oats, beans, psyllium), saturated fat under 10% of "
+            "calories (swap butter and fatty meat for olive oil, nuts, fish). Steady fat loss and your running volume help too."),
+    "hdl": ("HDL cholesterol", {"2085-9"}, ("hdl",), "mg/dL", (40, None), "high",
+            "Aerobic volume raises HDL, and you already run 30+ mi a week. Keep unsaturated fats (nuts, olive oil, fish) in "
+            "the diet rather than going very low-fat."),
+    "tc": ("Total cholesterol", {"2093-3"}, ("cholesterol, total", "total cholesterol", "cholesterol"), "mg/dL", (None, 200), "low",
+           "Same levers as LDL: soluble fiber and less saturated fat."),
+    "tg": ("Triglycerides", {"2571-8"}, ("triglyceride",), "mg/dL", (None, 150), "low",
+           "Triglycerides respond fast to added sugar, refined carbs and alcohol. Keep carbs around training rather than as "
+           "snacks, and eat oily fish twice a week. Test fasting."),
+    "apob": ("ApoB", {"1884-6"}, ("apolipoprotein b", "apob"), "mg/dL", (None, 90), "low",
+             "Same levers as LDL: soluble fiber, less saturated fat, steady fat loss."),
+    "lpa": ("Lp(a)", {"10835-7", "43583-4"}, ("lipoprotein (a)", "lp(a)", "lipoprotein a"), "mg/dL", (None, 50), "low",
+            "Mostly genetic; diet and training barely change it. If high, it makes keeping LDL and ApoB low more important."),
+    "a1c": ("Hemoglobin A1c", {"4548-4", "17856-6"}, ("a1c", "hemoglobin a1c", "glycated"), "%", (None, 5.7), "low",
+            "Training is already working for you here. Favor fiber-rich carbs, avoid sugary drinks. Runners can read "
+            "slightly low because red cells turn over faster."),
+    "glucose": ("Fasting glucose", {"2345-7", "1558-6", "2339-0"}, ("glucose",), "mg/dL", (70, 99), "range",
+                "Test fasting and not the morning after a very hard or long session, which can nudge it up. Fiber with carbs and "
+                "keeping the deficit moderate both help."),
+    "vitd": ("Vitamin D (25-OH)", {"1989-3", "62292-8", "35365-6"}, ("vitamin d", "25-hydroxy", "25(oh)"), "ng/mL", (30, 100), "high",
+             "At your latitude winter levels fall. Fatty fish and fortified dairy help; ask your doctor about a 1,000-2,000 IU "
+             "supplement Oct-Mar. Low vitamin D raises stress-fracture risk for runners."),
+    "ferritin": ("Ferritin", {"2276-4"}, ("ferritin",), "ng/mL", (35, 400), "range",
+                 "Runners lose iron through sweat, the gut and foot-strike; under about 35 ng/mL hurts endurance even before "
+                 "anemia. Eat iron-rich foods with vitamin C, keep coffee and tea away from those meals, and fix low energy availability."),
+    "iron": ("Iron", {"2498-4"}, ("iron, serum", "iron"), "ug/dL", (65, 175), "range",
+             "Same levers as ferritin: iron-rich foods with vitamin C, coffee and tea away from those meals."),
+    "hgb": ("Hemoglobin", {"718-7"}, ("hemoglobin",), "g/dL", (13.5, 17.5), "range",
+            "Endurance training expands plasma volume, so runners read a little low ('sports anemia'). A real drop points to "
+            "iron or low energy availability."),
+    "hct": ("Hematocrit", {"4544-3", "20570-8"}, ("hematocrit",), "%", (38.5, 50), "range",
+            "Moves with hydration and plasma volume; read it with hemoglobin and ferritin."),
+    "b12": ("Vitamin B12", {"2132-9"}, ("b12", "cobalamin"), "pg/mL", (300, 900), "range",
+            "Meat, fish, eggs and dairy cover it; absorption falls with age and with acid-reducing medicines."),
+    "testo": ("Testosterone, total", {"2986-8"}, ("testosterone",), "ng/dL", (300, 1000), "range",
+              "Low energy availability, short sleep, heavy training blocks and fat under 20% of calories all lower it. Your logs "
+              "show a large deficit, so eat more on training days and protect sleep before retesting."),
+    "tsh": ("TSH", {"3016-3", "11580-8"}, ("tsh", "thyroid stimulating"), "mIU/L", (0.4, 4.0), "range",
+            "Mainly medical, but prolonged low energy availability can slow thyroid output."),
+    "hscrp": ("hs-CRP", {"30522-7", "1988-5"}, ("c-reactive", "crp"), "mg/L", (None, 1.0), "low",
+              "Hard sessions raise it for 1-2 days, so test after 48 h of easy training. Omega-3 fish, fiber and fat loss lower baseline."),
+    "alt": ("ALT", {"1742-6", "1743-4"}, ("alt", "alanine aminotransferase"), "U/L", (7, 55), "range",
+            "Hard runs and lifting can raise liver enzymes for days; test after 48-72 h of easy training. Alcohol and excess "
+            "body fat raise it too."),
+    "ast": ("AST", {"1920-8"}, ("ast", "aspartate aminotransferase"), "U/L", (8, 48), "range",
+            "AST also comes from muscle, so it jumps after hard or long runs and heavy lifting; test after 48-72 h easy."),
+    "ck": ("Creatine kinase", {"2157-6"}, ("creatine kinase", "ck,", "cpk"), "U/L", (39, 308), "range",
+           "Rises sharply for days after hard running and lifting; a high value right after training is expected."),
+    "creat": ("Creatinine", {"2160-0", "38483-4"}, ("creatinine",), "mg/dL", (0.74, 1.35), "range",
+              "Muscle mass, high protein, creatine supplements, hard exercise and dehydration all raise it, which can make eGFR "
+              "read falsely low. Hydrate and skip hard training for 48 h before the test."),
+    "egfr": ("eGFR", {"33914-3", "48642-3", "48643-1", "62238-1", "98979-8", "88293-6", "88294-4"}, ("egfr", "glomerular"),
+             "mL/min/1.73m2", (60, None), "high",
+             "Estimated from creatinine, so muscular, well-trained people can read low; ask about a cystatin C test if it is flagged."),
+    "uric": ("Uric acid", {"3084-1"}, ("uric acid", "urate"), "mg/dL", (3.5, 7.2), "range",
+             "Dehydration, alcohol, sugary drinks and large meat portions raise it; hydrate well around long runs."),
+    "potassium": ("Potassium", {"2823-3", "6298-4"}, ("potassium",), "mmol/L", (3.5, 5.0), "range",
+                  "Lost in sweat; potatoes, bananas, beans and yogurt replace it."),
+    "sodium": ("Sodium", {"2951-2", "2947-0"}, ("sodium",), "mmol/L", (135, 145), "range",
+               "Long runs with only water can lower it; use electrolytes on runs over 90 min."),
+    "calcium": ("Calcium", {"17861-6", "49765-1"}, ("calcium",), "mg/dL", (8.6, 10.3), "range",
+                "Blood calcium is tightly controlled, so it rarely reflects diet; bone health still needs 1,000 mg a day from food."),
+    "psa": ("PSA", {"2857-1", "35741-8"}, ("psa", "prostate specific"), "ng/mL", (None, 2.5), "low",
+            "Medical. Avoid long or hard runs and cycling for 48 h before the draw, which can nudge it up."),
+}
+
+
+def _lab_key(codes, name):
+    for k, t in LAB_TESTS.items():
+        if codes & t[1]:
+            return k
+    n = (name or "").lower()
+    # Longest keyword first so "hemoglobin a1c" doesn't land on "hemoglobin".
+    best = None
+    for k, t in LAB_TESTS.items():
+        for kw in t[2]:
+            if kw in n and (best is None or len(kw) > best[1]):
+                best = (k, len(kw))
+    if best and best[0] == "tc" and any(x in n for x in ("ldl", "hdl", "ratio", "non-hdl", "non hdl")):
+        return None
+    if best and best[0] == "glucose" and ("urine" in n or "ua" == n[:2]):
+        return None
+    return best[0] if best else None
+
+
+def _fhir_obs(res):
+    """One FHIR Observation (DSTU2 or R4) -> dict or None."""
+    if not isinstance(res, dict) or res.get("resourceType") != "Observation":
+        return None
+    code = res.get("code") or {}
+    codes = {c.get("code") for c in code.get("coding", []) if c.get("code")}
+    name = code.get("text") or next((c.get("display") for c in code.get("coding", []) if c.get("display")), "")
+    vq = res.get("valueQuantity") or {}
+    val = vq.get("value")
+    if not isinstance(val, (int, float)):
+        try:
+            val = float(str(res.get("valueString", "")).strip().lstrip("<>").split()[0])
+        except (ValueError, IndexError):
+            return None
+    when = res.get("effectiveDateTime") or (res.get("effectivePeriod") or {}).get("start") or res.get("issued")
+    if not when:
+        return None
+    lo = hi = None
+    for rr in res.get("referenceRange", []) or []:
+        lo = (rr.get("low") or {}).get("value", lo)
+        hi = (rr.get("high") or {}).get("value", hi)
+    return dict(d=str(when)[:10], codes=codes, name=name, value=float(val), unit=vq.get("unit") or vq.get("code") or "",
+                low=lo, high=hi)
+
+
+def _walk_fhir(obj):
+    if isinstance(obj, list):
+        for x in obj:
+            yield from _walk_fhir(x)
+    elif isinstance(obj, dict):
+        if obj.get("resourceType") == "Bundle":
+            for e in obj.get("entry", []) or []:
+                yield from _walk_fhir(e.get("resource"))
+        else:
+            o = _fhir_obs(obj)
+            if o:
+                yield o
+
+
+def load_labs(directory=LABS_DIR):
+    """Lab results from Apple Health: FHIR JSON files (the export's clinical-records folder), a zip of them,
+    or a simple CSV (date,test,value,unit[,low,high]). Returns {key: [points sorted by date]}."""
+    import zipfile
+    raw = []
+    if not directory.exists():
+        return {}
+    for f in sorted(directory.rglob("*")):
+        try:
+            if f.suffix.lower() == ".json":
+                raw += list(_walk_fhir(json.loads(f.read_text())))
+            elif f.suffix.lower() == ".zip":
+                with zipfile.ZipFile(f) as z:
+                    for n in z.namelist():
+                        if n.lower().endswith(".json") and "clinical" in n.lower() or n.lower().endswith(".json") and "/" not in n:
+                            try:
+                                raw += list(_walk_fhir(json.loads(z.read(n))))
+                            except ValueError:
+                                pass
+            elif f.suffix.lower() == ".csv":
+                for r in csv.DictReader(io.StringIO(f.read_text())):
+                    r = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
+                    try:
+                        v = float(r.get("value", "").lstrip("<>"))
+                    except ValueError:
+                        continue
+                    num = lambda s: float(s) if s not in (None, "") else None
+                    raw.append(dict(d=_day(r.get("date")), codes={r.get("loinc", "")}, name=r.get("test", ""), value=v,
+                                    unit=r.get("unit", ""), low=num(r.get("low")), high=num(r.get("high"))))
+        except (OSError, ValueError, zipfile.BadZipFile):
+            continue
+    out = {}
+    for o in raw:
+        k = _lab_key(o["codes"], o["name"])
+        if not k or not o["d"]:
+            continue
+        out.setdefault(k, {})[o["d"]] = o  # one value per test per day; duplicates across files collapse
+    return {k: sorted(v.values(), key=lambda o: o["d"]) for k, v in out.items()}
+
+
+def lab_insights(labs, report, ctx=None):
+    """Per test: every value, latest vs range, trend, and the training/diet lever when one exists."""
+    ctx = ctx or {}
+    rows = []
+    for k, pts in labs.items():
+        label, _, _, unit, (dlo, dhi), better, action = LAB_TESTS[k]
+        last = pts[-1]
+        lo = last["low"] if last["low"] is not None else dlo
+        hi = last["high"] if last["high"] is not None else dhi
+        v = last["value"]
+        status = "high" if hi is not None and v > hi else "low" if lo is not None and v < lo else "ok"
+        if better == "low" and status == "low":
+            status = "ok"
+        if better == "high" and status == "high":
+            status = "ok"
+        trend = None
+        if len(pts) >= 2:
+            first = pts[0]["value"]
+            delta = v - first
+            span = max(abs(first), 1e-9)
+            if abs(delta) / span < 0.05:
+                trend = "steady"
+            else:
+                up = delta > 0
+                trend = ("better" if (up and better == "high") or (not up and better == "low") else
+                         "worse" if better in ("high", "low") else ("up" if up else "down"))
+        note = action
+        if k in ("testo", "ferritin", "hgb", "tsh") and (ctx.get("ea") or 99) < 30 and status != "ok":
+            note += f" Your logged energy availability is about {ctx['ea']:.0f} kcal/kg lean mass, under the 30 threshold."
+        if k in ("creat", "egfr") and (ctx.get("protein_gkg") or 0) >= 1.6:
+            note += " Your protein intake is high enough to nudge creatinine up."
+        rows.append(dict(key=k, label=label, unit=last["unit"] or unit, latest=v, date=last["d"], low=lo, high=hi,
+                         status=status, trend=trend, n=len(pts), first_date=pts[0]["d"], first=pts[0]["value"],
+                         points=[(p["d"], p["value"]) for p in pts], action=note,
+                         age_days=(report - dt.date.fromisoformat(last["d"])).days))
+    order = {"high": 0, "low": 0, "ok": 1}
+    rows.sort(key=lambda r: (order[r["status"]], r["trend"] != "worse", r["label"]))
+    flagged = [r for r in rows if r["status"] != "ok" or r["trend"] == "worse"]
+    return dict(rows=rows, flagged=flagged, tests=len(rows), years=sorted({p[0][:4] for r in rows for p in r["points"]}))
+
+
+def lab_spark(r, W=220, H=56):
+    pts = r["points"]
+    xs = [dt.date.fromisoformat(d).toordinal() for d, _ in pts]
+    vals = [v for _, v in pts] + [x for x in (r["low"], r["high"]) if x is not None]
+    lo_v, hi_v = min(vals), max(vals)
+    if hi_v == lo_v:
+        hi_v += 1
+        lo_v -= 1
+    pad = (hi_v - lo_v) * 0.15
+    lo_v, hi_v = lo_v - pad, hi_v + pad
+    x0, x1 = min(xs), max(xs) if max(xs) > min(xs) else min(xs) + 1
+    X = lambda x: 6 + (x - x0) * (W - 12) / (x1 - x0)
+    Y = lambda v: 4 + (hi_v - v) * (H - 8) / (hi_v - lo_v)
+    g = [f'<svg viewBox="0 0 {W} {H}" class="spark" role="img" aria-label="{esc(r["label"])} trend">']
+    blo = r["low"] if r["low"] is not None else lo_v
+    bhi = r["high"] if r["high"] is not None else hi_v
+    g.append(f'<rect x="0" y="{Y(bhi):.1f}" width="{W}" height="{max(0, Y(blo) - Y(bhi)):.1f}" style="fill:var(--good);opacity:.12"/>')
+    if len(pts) > 1:
+        g.append('<path d="' + " ".join(f"{'M' if i == 0 else 'L'}{X(x):.1f},{Y(v):.1f}" for i, (x, (_, v)) in enumerate(zip(xs, pts)))
+                 + '" style="fill:none;stroke:var(--c1);stroke-width:2"/>')
+    for x, (d, v) in zip(xs, pts):
+        bad = (r["high"] is not None and v > r["high"]) or (r["low"] is not None and v < r["low"])
+        g.append(f'<circle cx="{X(x):.1f}" cy="{Y(v):.1f}" r="3" style="fill:var(--{"bad" if bad else "c1"})">'
+                 f'<title>{d}: {v:g}</title></circle>')
+    g.append("</svg>")
+    return "".join(g)
+
+
+def _lab_fmt(v):
+    if float(v).is_integer():
+        return f"{v:,.0f}"
+    return f"{v:,.0f}" if abs(v) >= 100 else f"{v:.1f}" if abs(v) >= 10 else f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def _lab_range(r):
+    if r["low"] is not None and r["high"] is not None:
+        return f"{_lab_fmt(r['low'])}–{_lab_fmt(r['high'])}"
+    if r["high"] is not None:
+        return f"under {_lab_fmt(r['high'])}"
+    if r["low"] is not None:
+        return f"over {_lab_fmt(r['low'])}"
+    return "—"
+
+
+def labs_section(li):
+    if not li:
+        return ('<section><h2>Lab results · from Apple Health</h2><div class="panel muted">No lab results yet. In the Health app tap '
+                'your profile picture → Export All Health Data, unzip export.zip, and upload the <b>clinical-records</b> folder '
+                '(or the whole zip if it is small) to the Google Drive folder “Apple Health Labs”. A CSV with columns '
+                'date,test,value,unit,low,high works too. The report then charts every test across all years and links '
+                'out-of-range results to changes in training or diet.</div></section>')
+    st_cls = {"ok": ("better", "In range"), "high": ("watch", "High"), "low": ("watch", "Low")}
+    tr_txt = {"better": "▲ improving", "worse": "▼ worsening", "steady": "● steady", "up": "↑ rising", "down": "↓ falling", None: "one result"}
+    rows = []
+    for r in li["rows"]:
+        stale = f' <span class="muted">({r["age_days"] // 365} yr ago)</span>' if r["age_days"] > 400 else ""
+        rows.append(f'<tr><td><b>{esc(r["label"])}</b><br><span class="muted" style="font-size:12px">{r["n"]} result'
+                    f'{"s" if r["n"] != 1 else ""} · {r["first_date"][:4]}–{r["date"][:4]}</span></td>'
+                    f'<td>{lab_spark(r)}</td>'
+                    f'<td class="num">{_lab_fmt(r["latest"])} {esc(r["unit"])}<br><span class="muted" style="font-size:12px">'
+                    f'{dt.date.fromisoformat(r["date"]).strftime("%b %Y")}{stale}</span></td>'
+                    f'<td class="num">{_lab_range(r)}</td>'
+                    f'<td><span class="pill {st_cls[r["status"]][0]}" style="white-space:nowrap">{st_cls[r["status"]][1]}</span><br>'
+                    f'<span class="muted" style="font-size:12px">{tr_txt[r["trend"]]}</span></td>'
+                    f'<td style="font-size:13px">{esc(r["action"]) if r["status"] != "ok" or r["trend"] == "worse" else ""}</td></tr>')
+    return ('<section><h2>Lab results · from Apple Health</h2><div class="panel tbl"><table class="peer" style="min-width:760px">'
+            '<thead><tr><th>Test</th><th>Trend (green band = reference range)</th><th>Latest</th><th>Range</th><th>Status</th>'
+            f'<th>What training or diet can change</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
+            f'<p class="muted" style="margin:8px 0 0;font-size:12px">{li["tests"]} tests across {", ".join(li["years"])}. '
+            'Ranges are the lab\'s own when the record includes one, otherwise typical adult-male ranges. '
+            'Hard training in the 48 hours before a draw can raise AST, ALT, CK, creatinine and CRP. Not medical advice; '
+            'discuss flagged results with your doctor.</p></div></section>')
+
+
 # ---------------------------------------------------------------- peer comparison
 
 # FRIEND registry treadmill VO2 max percentiles, men (Kaminsky et al., Mayo Clin Proc 2015,
@@ -2263,6 +2551,7 @@ def render(report, days, ms, recs, plan, generated, wo=None, x=None):
 {body_comp_section(x.get("body_comp"), x.get("weighins") or []) if "body_comp" in x else ""}
 {nutrition_section(x.get("nutrition"), x.get("food") or {}, x.get("burn") or {}, report) if "nutrition" in x else ""}
 {diet_fit_section(x.get("diet_fit"), x.get("gaps"))}
+{labs_section(x.get("labs"))}
 {peer_section(x.get("peers"))}
 <section><h2>How the last 24 hours compare</h2>
 <div class="panel"><div class="legend"><span><i style="background:var(--bad)"></i>Worse than 30-day avg</span>
@@ -2437,6 +2726,22 @@ def render_email(report, ms, recs, plan, wo, x, state, tone, summary, bullets):
                 body += p(f'Not in your export yet: {esc(", ".join(untracked))}. Add them to the Apple Health export to check for gaps.',
                           f"color:{muted}")
         out.append(card("How your diet fits your training", body))
+    li = x.get("labs")
+    if li:
+        sym = {"better": "▲ improving", "worse": "▼ worsening", "steady": "steady", "up": "rising", "down": "falling", None: ""}
+        body = ""
+        for r in li["flagged"]:
+            col = "#b42f2f" if r["status"] != "ok" else "#8a5d00"
+            body += p(f'<b style="color:{col}">{esc(r["label"])}: {_lab_fmt(r["latest"])} {esc(r["unit"])}</b> '
+                      f'({dt.date.fromisoformat(r["date"]).strftime("%b %Y")}, range {_lab_range(r)}'
+                      + (f'; {_lab_fmt(r["first"])} in {r["first_date"][:4]}, {sym[r["trend"]]}' if r["n"] > 1 else "")
+                      + f'). {esc(r["action"])}')
+        ok = [r["label"] for r in li["rows"] if r not in li["flagged"]]
+        if ok:
+            body += p("In range: " + esc(", ".join(ok)) + ".", f"color:{muted}")
+        if not li["flagged"]:
+            body = p("Every test is in range and none is trending the wrong way.") + body
+        out.append(card(f'Lab results · {li["tests"]} tests, {li["years"][0]}–{li["years"][-1]}', body))
     peers = x.get("peers")
     if peers:
         rows = "".join(f'<tr><td style="{td}"><b>{esc(r["metric"])}</b></td><td style="{td}">{esc(r["you"])}</td>'
@@ -2517,6 +2822,9 @@ def main() -> int:
     lean_lb = (extras["body_comp"] or {}).get("latest", {}).get("lean")
     extras["diet_fit"] = diet_vs_training(extras["food"], load_meals(), days, report, latest_lb, lean_lb, bmr, wo)
     extras["gaps"] = nutrient_gaps(extras["food"], report, (extras["nutrition"] or {}).get("kcal7")) if extras["food"] else None
+    df = extras["diet_fit"] or {}
+    labs = load_labs()
+    extras["labs"] = lab_insights(labs, report, {"ea": df.get("ea"), "protein_gkg": df.get("protein_gkg")}) if labs else None
     page = render(report, days, ms, recs, plan, now.strftime("%Y-%m-%d %H:%M %Z"), wo, extras)
     out.write_text(page)
     # Standalone copy with its own document skeleton, for publishers that don't add one.
@@ -2545,6 +2853,11 @@ def main() -> int:
                   nutrient_gaps=({"short": [g["nutrient"] for g in extras["gaps"]["rows"] if g["status"] in ("short", "high")],
                                   "not_tracked": [g["nutrient"] for g in extras["gaps"]["rows"] if g["status"] == "not tracked"],
                                   "notes": extras["gaps"]["notes"]} if extras["gaps"] else None),
+                  labs=({"tests": extras["labs"]["tests"], "years": extras["labs"]["years"],
+                         "flagged": [{k: r[k] for k in ("label", "latest", "unit", "date", "low", "high", "status", "trend", "first", "first_date", "n", "action")}
+                                     for r in extras["labs"]["flagged"]],
+                         "in_range": [r["label"] for r in extras["labs"]["rows"] if r not in extras["labs"]["flagged"]]}
+                        if extras["labs"] else None),
                   vo2max=extras["vo2"][-1][1] if extras["vo2"] else None,
                   garmin_signin_expires=extras["auth_expiry"].isoformat() if extras["auth_expiry"] else None,
                   metrics=[{k: m.get(k) for k in ("label", "cur", "a7", "a30", "status", "unit")} for m in ms])
