@@ -2031,7 +2031,7 @@ LAB_TESTS = {
             "the diet rather than going very low-fat."),
     "tc": ("Total cholesterol", {"2093-3"}, ("cholesterol, total", "total cholesterol", "cholesterol"), "mg/dL", (None, 200), "low",
            "Same levers as LDL: soluble fiber and less saturated fat."),
-    "tg": ("Triglycerides", {"2571-8"}, ("triglyceride",), "mg/dL", (None, 150), "low",
+    "tg": ("Triglycerides", {"2571-8"}, ("triglycerides", "triglyceride"), "mg/dL", (None, 150), "low",
            "Triglycerides respond fast to added sugar, refined carbs and alcohol. Keep carbs around training rather than as "
            "snacks, and eat oily fish twice a week. Test fasting."),
     "apob": ("ApoB", {"1884-6"}, ("apolipoprotein b", "apob"), "mg/dL", (None, 90), "low",
@@ -2055,7 +2055,7 @@ LAB_TESTS = {
     "hgb": ("Hemoglobin", {"718-7"}, ("hemoglobin",), "g/dL", (13.5, 17.5), "range",
             "Endurance training expands plasma volume, so runners read a little low ('sports anemia'). A real drop points to "
             "iron or low energy availability."),
-    "hct": ("Hematocrit", {"4544-3", "20570-8"}, ("hematocrit",), "%", (38.5, 50), "range",
+    "hct": ("Hematocrit", {"4544-3", "20570-8"}, ("hematocrit", "hct"), "%", (38.5, 50), "range",
             "Moves with hydration and plasma volume; read it with hemoglobin and ferritin."),
     "b12": ("Vitamin B12", {"2132-9"}, ("b12", "cobalamin"), "pg/mL", (300, 900), "range",
             "Meat, fish, eggs and dairy cover it; absorption falls with age and with acid-reducing medicines."),
@@ -2093,21 +2093,21 @@ LAB_TESTS = {
 
 
 def _lab_key(codes, name):
+    """LOINC code first; otherwise the first test (in LAB_TESTS order) whose keyword appears as a whole word.
+    Ratios, VLDL and race-adjusted eGFR are left out."""
+    import re
     for k, t in LAB_TESTS.items():
         if codes & t[1]:
             return k
     n = (name or "").lower()
-    # Longest keyword first so "hemoglobin a1c" doesn't land on "hemoglobin".
-    best = None
+    if not n or "ratio" in n or "vldl" in n or re.search(r"ldl\s*/\s*hdl", n) or "non-hdl" in n or "non hdl" in n \
+            or re.match(r"egfr,?\s*african american", n) or "urine" in n or "ionized" in n:
+        return None
     for k, t in LAB_TESTS.items():
         for kw in t[2]:
-            if kw in n and (best is None or len(kw) > best[1]):
-                best = (k, len(kw))
-    if best and best[0] == "tc" and any(x in n for x in ("ldl", "hdl", "ratio", "non-hdl", "non hdl")):
-        return None
-    if best and best[0] == "glucose" and ("urine" in n or "ua" == n[:2]):
-        return None
-    return best[0] if best else None
+            if re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z])", n):
+                return k
+    return None
 
 
 def _fhir_obs(res):
@@ -2185,48 +2185,96 @@ def load_labs(directory=LABS_DIR):
         k = _lab_key(o["codes"], o["name"])
         if not k or not o["d"]:
             continue
-        out.setdefault(k, {})[o["d"]] = o  # one value per test per day; duplicates across files collapse
+        day = out.setdefault(k, {})
+        prev = day.get(o["d"])
+        # One value per test per day: prefer the main lab over point-of-care, and a direct LDL over a calculated one.
+        if prev and (("poc" in o["name"].lower() and "poc" not in prev["name"].lower())
+                     or ("direct" in prev["name"].lower() and "direct" not in o["name"].lower())):
+            continue
+        day[o["d"]] = o
     return {k: sorted(v.values(), key=lambda o: o["d"]) for k, v in out.items()}
 
 
+TRAINING_SENSITIVE = {"creat", "egfr", "ast", "alt", "ck", "hscrp"}
+
+
+def training_before(day, hours=48):
+    """Garmin activities in the 48 h before a morning blood draw (only where the archive covers that date)."""
+    d = dt.date.fromisoformat(day)
+    start = (d - dt.timedelta(days=2)).isoformat()
+    try:
+        rows = sql(f"""SELECT json_extract(data,'$.startTimeLocal') s, json_extract(data,'$.activityName') n,
+            json_extract(data,'$.activityTrainingLoad') l, json_extract(data,'$.duration')/60.0 m
+            FROM resources WHERE resource_type='activities'
+              AND substr(json_extract(data,'$.startTimeLocal'),1,10) BETWEEN '{start}' AND '{day}'""")
+    except RuntimeError:
+        return None
+    cutoff = f"{day} 09:00"
+    rows = [r for r in rows if str(r["s"]) < cutoff and (r["m"] or 0) >= 10]
+    return rows
+
+
 def lab_insights(labs, report, ctx=None):
-    """Per test: every value, latest vs range, trend, and the training/diet lever when one exists."""
+    """Per test: every value, latest vs range, trend, recent out-of-range results, and the training/diet lever."""
     ctx = ctx or {}
     rows = []
     for k, pts in labs.items():
         label, _, _, unit, (dlo, dhi), better, action = LAB_TESTS[k]
         last = pts[-1]
+        if k == "lpa" and "nmol" in (last["unit"] or "").lower():
+            dhi = 125
         lo = last["low"] if last["low"] is not None else dlo
         hi = last["high"] if last["high"] is not None else dhi
+
+        def state(p):
+            plo = p["low"] if p["low"] is not None else lo
+            phi = p["high"] if p["high"] is not None else hi
+            v = p["value"]
+            st_ = "high" if phi is not None and v > phi else "low" if plo is not None and v < plo else "ok"
+            if (better == "low" and st_ == "low") or (better == "high" and st_ == "high"):
+                st_ = "ok"
+            return st_
         v = last["value"]
-        status = "high" if hi is not None and v > hi else "low" if lo is not None and v < lo else "ok"
-        if better == "low" and status == "low":
-            status = "ok"
-        if better == "high" and status == "high":
-            status = "ok"
+        status = state(last)
+        cutoff = (report - dt.timedelta(days=730)).isoformat()
+        recent_out = [p for p in pts if p["d"] >= cutoff and state(p) != "ok"]
         trend = None
         if len(pts) >= 2:
             first = pts[0]["value"]
             delta = v - first
-            span = max(abs(first), 1e-9)
-            if abs(delta) / span < 0.05:
+            if abs(delta) / max(abs(first), 1e-9) < 0.05:
                 trend = "steady"
             else:
                 up = delta > 0
                 trend = ("better" if (up and better == "high") or (not up and better == "low") else
                          "worse" if better in ("high", "low") else ("up" if up else "down"))
+        # A worsening trend only matters once the value is within 15% of its limit.
+        near = (hi is not None and v >= hi * 0.85) or (lo is not None and v <= lo * 1.15)
         note = action
         if k in ("testo", "ferritin", "hgb", "tsh") and (ctx.get("ea") or 99) < 30 and status != "ok":
             note += f" Your logged energy availability is about {ctx['ea']:.0f} kcal/kg lean mass, under the 30 threshold."
         if k in ("creat", "egfr") and (ctx.get("protein_gkg") or 0) >= 1.6:
             note += " Your protein intake is high enough to nudge creatinine up."
+        pre = []
+        if k in TRAINING_SENSITIVE:
+            for p in recent_out or ([last] if status != "ok" else []):
+                acts = training_before(p["d"])
+                if acts:
+                    hard = max(acts, key=lambda a: a["l"] or 0)
+                    pre.append(f'Before the {dt.date.fromisoformat(p["d"]).strftime("%b %-d, %Y")} draw you logged '
+                               f'{len(acts)} session{"s" if len(acts) != 1 else ""} in the prior 48 h, including '
+                               f'{hard["n"]} ({hard["m"]:.0f} min, load {hard["l"] or 0:.0f}).')
+        if recent_out and status == "ok":
+            outs = ", ".join(f'{_lab_fmt(p["value"])} ({dt.date.fromisoformat(p["d"]).strftime("%b %Y")})' for p in recent_out)
+            note = f"Back in range now, but out of range in the last two years: {outs}. " + note
+        note = " ".join([note] + pre)
+        flag = status != "ok" or bool(recent_out) or (trend == "worse" and near)
         rows.append(dict(key=k, label=label, unit=last["unit"] or unit, latest=v, date=last["d"], low=lo, high=hi,
                          status=status, trend=trend, n=len(pts), first_date=pts[0]["d"], first=pts[0]["value"],
-                         points=[(p["d"], p["value"]) for p in pts], action=note,
-                         age_days=(report - dt.date.fromisoformat(last["d"])).days))
-    order = {"high": 0, "low": 0, "ok": 1}
-    rows.sort(key=lambda r: (order[r["status"]], r["trend"] != "worse", r["label"]))
-    flagged = [r for r in rows if r["status"] != "ok" or r["trend"] == "worse"]
+                         points=[(p["d"], p["value"]) for p in pts], action=note, flag=flag,
+                         recent_out=len(recent_out), age_days=(report - dt.date.fromisoformat(last["d"])).days))
+    rows.sort(key=lambda r: (not r["flag"], r["status"] == "ok", r["label"]))
+    flagged = [r for r in rows if r["flag"]]
     return dict(rows=rows, flagged=flagged, tests=len(rows), years=sorted({p[0][:4] for r in rows for p in r["points"]}))
 
 
@@ -2268,12 +2316,18 @@ def lab_spark(r, W=270, H=78):
     years = list(range(y_first, y_last + 1))
     step = 1 if len(years) <= 6 else 2 if len(years) <= 12 else 5
     g.append(f'<line x1="{L}" x2="{W - R}" y1="{H - B}" y2="{H - B}" class="grid"/>')
+    labels = []
     for yr in years:
         a, b = max(x0, dt.date(yr, 1, 1).toordinal()), min(x1, dt.date(yr, 12, 31).toordinal())
         if yr != y_first:
             g.append(f'<line x1="{X(a):.1f}" x2="{X(a):.1f}" y1="{T}" y2="{H - B + 3}" class="grid"/>')
         if (yr - y_first) % step == 0 or yr == y_last:
-            g.append(f'<text x="{X((a + b) / 2):.1f}" y="{H - 5}" class="tick" text-anchor="middle">{yr}</text>')
+            labels.append((yr, X((a + b) / 2)))
+    # Always keep the latest year; drop the label before it if the two would collide.
+    if len(labels) >= 2 and labels[-1][1] - labels[-2][1] < 30:
+        del labels[-2]
+    for yr, cx in labels:
+        g.append(f'<text x="{cx:.1f}" y="{H - 5}" class="tick" text-anchor="middle">{yr}</text>')
     if len(pts) > 1:
         g.append('<path d="' + " ".join(f"{'M' if i == 0 else 'L'}{X(x):.1f},{Y(v):.1f}" for i, (x, (_, v)) in enumerate(zip(xs, pts)))
                  + '" style="fill:none;stroke:var(--c1);stroke-width:2"/>')
@@ -2321,7 +2375,7 @@ def labs_section(li):
                     f'<td class="num">{_lab_range(r)}</td>'
                     f'<td><span class="pill {st_cls[r["status"]][0]}" style="white-space:nowrap">{st_cls[r["status"]][1]}</span><br>'
                     f'<span class="muted" style="font-size:12px">{tr_txt[r["trend"]]}</span></td>'
-                    f'<td style="font-size:13px">{esc(r["action"]) if r["status"] != "ok" or r["trend"] == "worse" else ""}</td></tr>')
+                    f'<td style="font-size:13px">{esc(r["action"]) if r["flag"] else ""}</td></tr>')
     return ('<section><h2>Lab results · from Apple Health</h2><div class="panel tbl"><table class="peer" style="min-width:760px">'
             '<thead><tr><th>Test</th><th>Trend · green band and dashed lines = standard range</th><th>Latest</th><th>Range</th><th>Status</th>'
             f'<th>What training or diet can change</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
