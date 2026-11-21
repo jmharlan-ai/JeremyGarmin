@@ -779,7 +779,7 @@ footer{font-size:12px;color:var(--muted)}
 .badge{display:inline-flex;gap:6px;align-items:center;font-weight:700;font-size:13px;padding:2px 10px;border-radius:999px;border:1.5px solid currentColor}
 .badge.pass{color:var(--good-ink)}.badge.under{color:var(--bad-ink)}
 .notice{background:var(--panel);border:1px solid var(--warn);border-left:6px solid var(--warn);border-radius:12px;padding:12px 16px}
-.spark{width:240px;height:78px;display:block}table.peer td{text-align:left;vertical-align:top}table.peer th{text-align:left}
+.spark{width:270px;height:78px;display:block}table.peer td{text-align:left;vertical-align:top}table.peer th{text-align:left}
 table.peer td:nth-child(4){color:var(--ink2)}
 .panel a{color:var(--accent)}
 .remind{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;font-size:14px}
@@ -2230,7 +2230,7 @@ def lab_insights(labs, report, ctx=None):
     return dict(rows=rows, flagged=flagged, tests=len(rows), years=sorted({p[0][:4] for r in rows for p in r["points"]}))
 
 
-def lab_spark(r, W=240, H=78):
+def lab_spark(r, W=270, H=78):
     """Small trend chart for one test: values over time, reference band shaded, years on the x axis."""
     pts = r["points"]
     xs = [dt.date.fromisoformat(d).toordinal() for d, _ in pts]
@@ -2245,7 +2245,7 @@ def lab_spark(r, W=240, H=78):
     y_first, y_last = dt.date.fromordinal(min(xs)).year, dt.date.fromordinal(max(xs)).year
     x0 = min(min(xs), dt.date(y_first, 1, 1).toordinal())
     x1 = max(max(xs), dt.date(y_last, 12, 31).toordinal())
-    L, R, T, B = 14, 14, 4, 18
+    L, R, T, B = 14, 40, 6, 18
     X = lambda x: L + (x - x0) * (W - L - R) / (x1 - x0)
     Y = lambda v: T + (hi_v - v) * (H - T - B) / (hi_v - lo_v)
     g = [f'<svg viewBox="0 0 {W} {H}" class="spark" role="img" aria-label="{esc(r["label"])} by year">']
@@ -2253,6 +2253,17 @@ def lab_spark(r, W=240, H=78):
     bhi = r["high"] if r["high"] is not None else hi_v
     top, bot = max(T, Y(bhi)), min(H - B, Y(blo))
     g.append(f'<rect x="{L}" y="{top:.1f}" width="{W - L - R}" height="{max(0, bot - top):.1f}" style="fill:var(--good);opacity:.12"/>')
+    # Standard-range limits: dashed line at each bound, labelled at the right edge.
+    bounds = [(b, lab) for b, lab in ((r["high"], "high"), (r["low"], "low")) if b is not None]
+    ys = {lab: Y(b) for b, lab in bounds}
+    if len(ys) == 2 and ys["low"] - ys["high"] < 11:  # keep the two labels from overlapping
+        mid = (ys["low"] + ys["high"]) / 2
+        ys = {"high": mid - 5.5, "low": mid + 5.5}
+    for b, lab in bounds:
+        g.append(f'<line x1="{L}" x2="{W - R}" y1="{Y(b):.1f}" y2="{Y(b):.1f}" '
+                 f'style="stroke:var(--good-ink);stroke-width:1;stroke-dasharray:3 3;opacity:.8"/>')
+        g.append(f'<text x="{W - R + 4}" y="{ys[lab] + 3.5:.1f}" class="tick" style="fill:var(--good-ink)">'
+                 f'{"≤" if lab == "high" else "≥"}{_lab_fmt(b)}</text>')
     # Year axis: a tick at each Jan 1 and the year label centred in its span; thin out when crowded.
     years = list(range(y_first, y_last + 1))
     step = 1 if len(years) <= 6 else 2 if len(years) <= 12 else 5
@@ -2312,7 +2323,7 @@ def labs_section(li):
                     f'<span class="muted" style="font-size:12px">{tr_txt[r["trend"]]}</span></td>'
                     f'<td style="font-size:13px">{esc(r["action"]) if r["status"] != "ok" or r["trend"] == "worse" else ""}</td></tr>')
     return ('<section><h2>Lab results · from Apple Health</h2><div class="panel tbl"><table class="peer" style="min-width:760px">'
-            '<thead><tr><th>Test</th><th>Trend (green band = reference range)</th><th>Latest</th><th>Range</th><th>Status</th>'
+            '<thead><tr><th>Test</th><th>Trend · green band and dashed lines = standard range</th><th>Latest</th><th>Range</th><th>Status</th>'
             f'<th>What training or diet can change</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
             f'<p class="muted" style="margin:8px 0 0;font-size:12px">{li["tests"]} tests across {", ".join(li["years"])}. '
             'Ranges are the lab\'s own when the record includes one, otherwise typical adult-male ranges. '
