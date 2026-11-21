@@ -779,7 +779,7 @@ footer{font-size:12px;color:var(--muted)}
 .badge{display:inline-flex;gap:6px;align-items:center;font-weight:700;font-size:13px;padding:2px 10px;border-radius:999px;border:1.5px solid currentColor}
 .badge.pass{color:var(--good-ink)}.badge.under{color:var(--bad-ink)}
 .notice{background:var(--panel);border:1px solid var(--warn);border-left:6px solid var(--warn);border-radius:12px;padding:12px 16px}
-.spark{width:220px;height:56px;display:block}table.peer td{text-align:left;vertical-align:top}table.peer th{text-align:left}
+.spark{width:240px;height:78px;display:block}table.peer td{text-align:left;vertical-align:top}table.peer th{text-align:left}
 table.peer td:nth-child(4){color:var(--ink2)}
 .panel a{color:var(--accent)}
 .remind{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;font-size:14px}
@@ -2230,7 +2230,8 @@ def lab_insights(labs, report, ctx=None):
     return dict(rows=rows, flagged=flagged, tests=len(rows), years=sorted({p[0][:4] for r in rows for p in r["points"]}))
 
 
-def lab_spark(r, W=220, H=56):
+def lab_spark(r, W=240, H=78):
+    """Small trend chart for one test: values over time, reference band shaded, years on the x axis."""
     pts = r["points"]
     xs = [dt.date.fromisoformat(d).toordinal() for d, _ in pts]
     vals = [v for _, v in pts] + [x for x in (r["low"], r["high"]) if x is not None]
@@ -2240,20 +2241,35 @@ def lab_spark(r, W=220, H=56):
         lo_v -= 1
     pad = (hi_v - lo_v) * 0.15
     lo_v, hi_v = lo_v - pad, hi_v + pad
-    x0, x1 = min(xs), max(xs) if max(xs) > min(xs) else min(xs) + 1
-    X = lambda x: 6 + (x - x0) * (W - 12) / (x1 - x0)
-    Y = lambda v: 4 + (hi_v - v) * (H - 8) / (hi_v - lo_v)
-    g = [f'<svg viewBox="0 0 {W} {H}" class="spark" role="img" aria-label="{esc(r["label"])} trend">']
+    # Span at least one calendar year so a lone result still sits on a labelled axis.
+    y_first, y_last = dt.date.fromordinal(min(xs)).year, dt.date.fromordinal(max(xs)).year
+    x0 = min(min(xs), dt.date(y_first, 1, 1).toordinal())
+    x1 = max(max(xs), dt.date(y_last, 12, 31).toordinal())
+    L, R, T, B = 14, 14, 4, 18
+    X = lambda x: L + (x - x0) * (W - L - R) / (x1 - x0)
+    Y = lambda v: T + (hi_v - v) * (H - T - B) / (hi_v - lo_v)
+    g = [f'<svg viewBox="0 0 {W} {H}" class="spark" role="img" aria-label="{esc(r["label"])} by year">']
     blo = r["low"] if r["low"] is not None else lo_v
     bhi = r["high"] if r["high"] is not None else hi_v
-    g.append(f'<rect x="0" y="{Y(bhi):.1f}" width="{W}" height="{max(0, Y(blo) - Y(bhi)):.1f}" style="fill:var(--good);opacity:.12"/>')
+    top, bot = max(T, Y(bhi)), min(H - B, Y(blo))
+    g.append(f'<rect x="{L}" y="{top:.1f}" width="{W - L - R}" height="{max(0, bot - top):.1f}" style="fill:var(--good);opacity:.12"/>')
+    # Year axis: a tick at each Jan 1 and the year label centred in its span; thin out when crowded.
+    years = list(range(y_first, y_last + 1))
+    step = 1 if len(years) <= 6 else 2 if len(years) <= 12 else 5
+    g.append(f'<line x1="{L}" x2="{W - R}" y1="{H - B}" y2="{H - B}" class="grid"/>')
+    for yr in years:
+        a, b = max(x0, dt.date(yr, 1, 1).toordinal()), min(x1, dt.date(yr, 12, 31).toordinal())
+        if yr != y_first:
+            g.append(f'<line x1="{X(a):.1f}" x2="{X(a):.1f}" y1="{T}" y2="{H - B + 3}" class="grid"/>')
+        if (yr - y_first) % step == 0 or yr == y_last:
+            g.append(f'<text x="{X((a + b) / 2):.1f}" y="{H - 5}" class="tick" text-anchor="middle">{yr}</text>')
     if len(pts) > 1:
         g.append('<path d="' + " ".join(f"{'M' if i == 0 else 'L'}{X(x):.1f},{Y(v):.1f}" for i, (x, (_, v)) in enumerate(zip(xs, pts)))
                  + '" style="fill:none;stroke:var(--c1);stroke-width:2"/>')
     for x, (d, v) in zip(xs, pts):
         bad = (r["high"] is not None and v > r["high"]) or (r["low"] is not None and v < r["low"])
         g.append(f'<circle cx="{X(x):.1f}" cy="{Y(v):.1f}" r="3" style="fill:var(--{"bad" if bad else "c1"})">'
-                 f'<title>{d}: {v:g}</title></circle>')
+                 f'<title>{d}: {_lab_fmt(v)}</title></circle>')
     g.append("</svg>")
     return "".join(g)
 
