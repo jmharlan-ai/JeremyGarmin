@@ -31,7 +31,9 @@ and checks key nutrients (fiber, iron, vitamin D, calcium, magnesium, potassium,
 folate, zinc, vitamin C, saturated fat) against the DRIs, listing any the export doesn't include. Lab results from Apple Health Health Records (FHIR JSON from the
 export's `clinical-records` folder, a zip of it, or a date,test,value,unit,low,high CSV in
 `reports/labs/`) are charted per test across every year available, checked against the lab's
-reference range, and linked to training or diet changes that can move them. `--json` includes a one-line `headline`
+reference range, and linked to training or diet changes that can move them. `scripts/labs_to_csv.py` converts a one-time
+Health app export (`clinical-records` folder or zip) into `apple-health-labs.csv`, which the
+morning task keeps in the Drive folder "Apple Health Labs" and copies into `reports/labs/`. `--json` includes a one-line `headline`
 for phone notifications.
 
 Requires a signed-in `garmin-pp-cli` (`garmin-pp-cli auth login --email ...`).
